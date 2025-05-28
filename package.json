@@ -1,0 +1,14 @@
+{
+  "name": "mediasoup",
+  "scripts": {
+    "b": "tsc -b",
+    "d": "node dist/index.js",
+    "l": "biome lint --write .",
+    "f": "biome format --write ."
+  },
+  "packageManager": "pnpm@10.11.0",
+  "devDependencies": {
+    "@biomejs/biome": "1.9.4",
+    "typescript": "5.8.3"
+  }
+}
