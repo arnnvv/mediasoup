@@ -2,4 +2,5 @@
 dist/
 .github/
 .gitignore
+hls-output/
 node_modules/

@@ -1,7 +1,7 @@
 {
   "name": "mediasoup",
   "scripts": {
-    "b": "tsc -b",
+    "b": "esbuild index.ts lib/*.ts --format=cjs --outdir=dist --tsconfig=./tsconfig.json",
     "d": "node dist/index.js",
     "l": "biome lint --write .",
     "f": "biome format --write ."
@@ -9,6 +9,15 @@
   "packageManager": "pnpm@10.11.0",
   "devDependencies": {
     "@biomejs/biome": "1.9.4",
+    "@types/express": "5.0.2",
+    "@types/node": "22.15.24",
+    "@types/ws": "8.18.1",
+    "esbuild": "0.25.5",
     "typescript": "5.8.3"
+  },
+  "dependencies": {
+    "express": "5.1.0",
+    "mediasoup": "3.16.0",
+    "ws": "8.18.2"
   }
 }
