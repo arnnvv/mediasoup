@@ -4,7 +4,9 @@ WORKDIR /app
 RUN corepack enable
 COPY package.json pnpm-lock.yaml ./
 RUN pnpm install --frozen-lockfile
-RUN pnpm --filter mediasoup run worker:build
+WORKDIR /app/node_modules/mediasoup
+RUN pnpm run worker:build
+WORKDIR /app
 COPY . .
 RUN pnpm run b
 RUN pnpm prune --prod
