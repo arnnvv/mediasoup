@@ -1,8 +1,10 @@
 FROM node:23.11-alpine3.21 AS builder
 WORKDIR /app
+#Install whateve's needed
 RUN corepack enable
 COPY package.json pnpm-lock.yaml ./
 RUN pnpm install --frozen-lockfile
+RUN pnpm --filter mediasoup run worker:build
 COPY . .
 RUN pnpm run b
 RUN pnpm prune --prod
