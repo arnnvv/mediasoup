@@ -1,525 +1,528 @@
-import WebSocket, { WebSocketServer } from "ws";
-import { URL } from "node:url";
-import * as wrtc from "@roamhq/wrtc";
-import * as fs from "node:fs";
-import * as path from "node:path";
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import express from "express";
-import type { SignalingMessage, DirectSignalPayload } from "./types";
+import WebSocket, { type Server } from "ws";
+import {
+  RTCPeerConnection,
+  RTCSessionDescription,
+  RTCIceCandidate,
+} from "werift";
+import { createWriteStream, mkdirSync, existsSync } from "fs";
+import { spawn, type ChildProcess } from "child_process";
+import express, { type Application } from "express";
+import path from "path";
 
-const PORT = 8080;
-const HTTP_PORT = 8081;
-const WSS_PATH = "/ws/stream";
-const HLS_BASE_PATH = "/hls";
-const HLS_OUTPUT_DIR = path.join(__dirname, "hls_output");
-
-if (!fs.existsSync(HLS_OUTPUT_DIR)) {
-  fs.mkdirSync(HLS_OUTPUT_DIR, { recursive: true });
+interface SignalingMessage {
+  type:
+    | "server-offer"
+    | "server-answer"
+    | "server-candidate"
+    | "direct-offer"
+    | "direct-answer"
+    | "direct-candidate"
+    | "signal-initiate-p2p";
+  payload: {
+    sdp?: RTCSessionDescriptionInit;
+    candidate?: RTCIceCandidateInit;
+    toPeerID?: string;
+    fromPeerID?: string;
+    clientId?: string;
+  };
 }
 
-const wss = new WebSocketServer({ port: PORT });
-const clients = new Map<string, WebSocket>();
-
-interface ServerPeerContext {
-  pc: wrtc.RTCPeerConnection;
-  clientId: string;
-  videoFile?: string;
-  audioFile?: string;
-  hasVideo: boolean;
-  hasAudio: boolean;
+interface ClientConnection {
+  id: string;
+  ws: WebSocket;
+  peerConnection?: RTCPeerConnection;
+  mediaStreams: {
+    video?: NodeJS.WritableStream;
+    audio?: NodeJS.WritableStream;
+  };
+  ffmpegProcess?: ChildProcess;
 }
-const serverRtcPeers = new Map<string, ServerPeerContext>();
-let ffmpegProcess: ChildProcessWithoutNullStreams | null = null;
 
-console.log(
-  `WebSocket Signaling Server started on ws://localhost:${PORT}${WSS_PATH}`,
-);
+class WebRTCSignalingServer {
+  private wss: Server;
+  private httpServer: Application;
+  private clients = new Map<string, ClientConnection>();
+  private outputDir = "./output";
+  private hlsDir = "./hls";
 
-const app = express();
-app.use((_req, res, next) => {
-  res.header("Access-Control-Allow-Origin", "*");
-  res.header(
-    "Access-Control-Allow-Headers",
-    "Origin, X-Requested-With, Content-Type, Accept",
-  );
-  next();
-});
-app.use(
-  HLS_BASE_PATH,
-  express.static(HLS_OUTPUT_DIR, {
-    setHeaders: (res, filePath) => {
-      if (path.basename(filePath).endsWith(".m3u8")) {
-        res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
-        res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-        res.setHeader("Pragma", "no-cache");
-        res.setHeader("Expires", "0");
-      } else if (path.basename(filePath).endsWith(".ts")) {
-        res.setHeader("Content-Type", "video/mp2t");
+  constructor() {
+    this.setupDirectories();
+
+    this.httpServer = express();
+    this.httpServer.use((req, res, next) => {
+      res.header("Access-Control-Allow-Origin", "*");
+      res.header(
+        "Access-Control-Allow-Methods",
+        "GET, POST, PUT, DELETE, OPTIONS",
+      );
+      res.header(
+        "Access-Control-Allow-Headers",
+        "Origin, X-Requested-With, Content-Type, Accept, Authorization",
+      );
+
+      if (req.method === "OPTIONS") {
+        res.sendStatus(200);
+      } else {
+        next();
       }
-    },
-  }),
-);
-app.listen(HTTP_PORT, () => {
-  console.log(
-    `HTTP server for HLS listening on http://localhost:${HTTP_PORT}${HLS_BASE_PATH}`,
-  );
-});
+    });
 
-function startOrUpdateFFmpeg() {
-  if (ffmpegProcess) {
-    console.log("[FFmpeg] Killing existing FFmpeg process for update.");
-    ffmpegProcess.kill("SIGINT");
-    ffmpegProcess = null;
-  }
+    this.httpServer.use("/hls", express.static(this.hlsDir));
 
-  const activePeersWithMedia = Array.from(serverRtcPeers.values()).filter(
-    (p) => p.videoFile || p.audioFile,
-  );
-  if (activePeersWithMedia.length === 0) {
-    console.log("[FFmpeg] No active media streams to process.");
-    const files = fs.readdirSync(HLS_OUTPUT_DIR);
+    this.httpServer.listen(8081, () => {
+      console.log("HTTP Server running on http://localhost:8081");
+      console.log("HLS available at http://localhost:8081/hls/playlist.m3u8");
+    });
 
-    for (const f of files) {
-      if (f.startsWith("live_") && (f.endsWith(".ts") || f.endsWith(".m3u8"))) {
+    this.wss = new WebSocket.Server({
+      port: 8080,
+      path: "/ws/stream",
+    });
+
+    this.wss.on("connection", (ws, req) => {
+      const url = new URL(req.url!, `http://${req.headers.host}`);
+      const clientId = url.searchParams.get("clientId");
+
+      if (!clientId) {
+        ws.close(1008, "Client ID required");
+        return;
+      }
+
+      const client: ClientConnection = {
+        id: clientId,
+        ws,
+        mediaStreams: {},
+      };
+
+      this.clients.set(clientId, client);
+      console.log(`Client ${clientId} connected`);
+
+      ws.on("message", async (data) => {
         try {
-          fs.unlinkSync(path.join(HLS_OUTPUT_DIR, f));
-        } catch (e) {
-          console.error(`Error unlinking ${f}: ${e}`);
+          const message: SignalingMessage = JSON.parse(data.toString());
+          await this.handleSignalingMessage(clientId, message);
+        } catch (error) {
+          console.error("Error handling message:", error);
         }
+      });
+
+      ws.on("close", () => {
+        this.handleClientDisconnect(clientId);
+      });
+
+      ws.on("error", (error) => {
+        console.error(`WebSocket error for client ${clientId}:`, error);
+        this.handleClientDisconnect(clientId);
+      });
+    });
+
+    console.log("WebSocket server running on ws://localhost:8080/ws/stream");
+  }
+
+  private setupDirectories() {
+    [this.outputDir, this.hlsDir].forEach((dir) => {
+      if (!existsSync(dir)) {
+        mkdirSync(dir, { recursive: true });
       }
-    }
-    return;
+    });
   }
 
-  const inputs: string[] = [];
-  const filterComplexParts: string[] = [];
-  const videoMapsOut: string[] = [];
-  const audioMapsOut: string[] = [];
-  let currentInputStreamIndex = 0;
+  private async handleSignalingMessage(
+    clientId: string,
+    message: SignalingMessage,
+  ) {
+    const client = this.clients.get(clientId);
+    if (!client) return;
 
-  let idx = 0;
+    switch (message.type) {
+      case "signal-initiate-p2p":
+        this.handleInitiateP2P(clientId);
+        break;
+      case "server-offer":
+        await this.handleServerOffer(clientId, message);
+        break;
+      case "server-candidate":
+        await this.handleServerCandidate(clientId, message);
+        break;
+      case "direct-offer":
+      case "direct-answer":
+      case "direct-candidate":
+        this.relayP2PMessage(clientId, message);
+        break;
+    }
+  }
 
-  for (const peerCtx of activePeersWithMedia) {
-    if (peerCtx.videoFile && fs.existsSync(peerCtx.videoFile)) {
-      inputs.push("-i", peerCtx.videoFile);
-      filterComplexParts.push(
-        `[${currentInputStreamIndex}:v]setpts=PTS-STARTPTS,scale=640:-1[v${idx}]`,
+  private handleInitiateP2P(fromClientId: string) {
+    // Broadcast to all other clients for peer discovery
+    this.clients.forEach((client, clientId) => {
+      if (
+        clientId !== fromClientId &&
+        client.ws.readyState === WebSocket.OPEN
+      ) {
+        client.ws.send(
+          JSON.stringify({
+            type: "signal-initiate-p2p",
+            payload: {
+              fromPeerID: fromClientId,
+            },
+          }),
+        );
+      }
+    });
+  }
+
+  private async handleServerOffer(clientId: string, message: SignalingMessage) {
+    const client = this.clients.get(clientId);
+    if (!client || !message.payload.sdp) return;
+
+    try {
+      // Create peer connection for this client
+      const pc = new RTCPeerConnection({
+        iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+      });
+
+      client.peerConnection = pc;
+
+      // Handle ICE candidates
+      pc.onicecandidate = ({ candidate }) => {
+        if (candidate && client.ws.readyState === WebSocket.OPEN) {
+          client.ws.send(
+            JSON.stringify({
+              type: "server-candidate",
+              payload: { candidate: candidate.toJSON() },
+            }),
+          );
+        }
+      };
+
+      // Handle incoming tracks
+      pc.ontrack = (event) => {
+        console.log(
+          `Received ${event.track.kind} track from client ${clientId}`,
+        );
+        this.handleIncomingTrack(clientId, event.track);
+      };
+
+      // Set remote description and create answer
+      await pc.setRemoteDescription(
+        new RTCSessionDescription(message.payload.sdp.sdp!, "offer"),
       );
-      videoMapsOut.push(`[v${idx}]`);
-      currentInputStreamIndex++;
-    }
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
 
-    if (peerCtx.audioFile && fs.existsSync(peerCtx.audioFile)) {
-      inputs.push("-i", peerCtx.audioFile);
-      filterComplexParts.push(
-        `[${currentInputStreamIndex}:a]asetpts=PTS-STARTPTS[a${idx}]`,
+      // Send answer back to client
+      client.ws.send(
+        JSON.stringify({
+          type: "server-answer",
+          payload: { sdp: pc.localDescription?.sdp },
+        }),
       );
-      audioMapsOut.push(`[a${idx}]`);
-      currentInputStreamIndex++;
+    } catch (error) {
+      console.error(`Error handling server offer from ${clientId}:`, error);
     }
-
-    idx++;
   }
 
-  if (videoMapsOut.length === 0 && audioMapsOut.length === 0) {
-    console.log("[FFmpeg] No valid media files found for FFmpeg input.");
-    return;
-  }
+  private async handleServerCandidate(
+    clientId: string,
+    message: SignalingMessage,
+  ) {
+    const client = this.clients.get(clientId);
+    if (!client?.peerConnection || !message.payload.candidate) return;
 
-  if (videoMapsOut.length > 0) {
-    if (videoMapsOut.length > 1) {
-      filterComplexParts.push(
-        `${videoMapsOut.join("")}hstack=inputs=${videoMapsOut.length}[vout]`,
+    try {
+      await client.peerConnection.addIceCandidate(
+        new RTCIceCandidate({ candidate: message.payload.candidate.candidate }),
       );
-    } else {
-      filterComplexParts.push(`${videoMapsOut[0]}copy[vout]`);
+    } catch (error) {
+      console.error(`Error adding ICE candidate for ${clientId}:`, error);
     }
   }
 
-  if (audioMapsOut.length > 0) {
-    if (audioMapsOut.length > 1) {
-      filterComplexParts.push(
-        `${audioMapsOut.join("")}amix=inputs=${audioMapsOut.length}[aout]`,
-      );
-    } else {
-      filterComplexParts.push(`${audioMapsOut[0]}copy[aout]`);
+  private relayP2PMessage(fromClientId: string, message: SignalingMessage) {
+    const targetClientId = message.payload.toPeerID;
+    if (!targetClientId) return;
+
+    const targetClient = this.clients.get(targetClientId);
+    if (targetClient && targetClient.ws.readyState === WebSocket.OPEN) {
+      // Add fromPeerID to the message
+      const relayMessage = {
+        ...message,
+        payload: {
+          ...message.payload,
+          fromPeerID: fromClientId,
+        },
+      };
+      targetClient.ws.send(JSON.stringify(relayMessage));
     }
   }
 
-  const outputPath = path.join(HLS_OUTPUT_DIR, "live.m3u8");
-  const segmentPath = path.join(HLS_OUTPUT_DIR, "live_%05d.ts");
+  private handleIncomingTrack(clientId: string, track: any) {
+    const client = this.clients.get(clientId);
+    if (!client) return;
 
-  const files = fs.readdirSync(HLS_OUTPUT_DIR);
+    const outputPath = path.join(this.outputDir, clientId);
+    if (!existsSync(outputPath)) {
+      mkdirSync(outputPath, { recursive: true });
+    }
 
-  for (const f of files) {
-    if (f.startsWith("live_") && (f.endsWith(".ts") || f.endsWith(".m3u8"))) {
+    if (track.kind === "video") {
+      this.setupVideoProcessing(clientId, track);
+    } else if (track.kind === "audio") {
+      this.setupAudioProcessing(clientId, track);
+    }
+  }
+
+  private setupVideoProcessing(clientId: string, track: any) {
+    const client = this.clients.get(clientId);
+    if (!client) return;
+
+    // Create named pipes for real-time processing
+    const videoPath = path.join(this.outputDir, clientId, "video.h264");
+    const ivfPath = path.join(this.outputDir, clientId, "video.ivf");
+
+    // Video file streams
+    const h264Stream = createWriteStream(videoPath);
+    const ivfStream = createWriteStream(ivfPath);
+
+    client.mediaStreams.video = h264Stream;
+
+    // Process RTP packets
+    track.onReceiveRtp = (packet: any) => {
       try {
-        fs.unlinkSync(path.join(HLS_OUTPUT_DIR, f));
-      } catch (e) {
-        console.error(`Error unlinking old HLS file ${f}: ${e}`);
+        // Write H264 with Annex B start codes
+        const nalSeparator = Buffer.from([0x00, 0x00, 0x00, 0x01]);
+        h264Stream.write(nalSeparator);
+        h264Stream.write(packet.payload);
+
+        // Write IVF format for VP8/VP9
+        if (packet.payloadType === 96 || packet.payloadType === 97) {
+          // VP8/VP9
+          const frameHeader = Buffer.alloc(12);
+          frameHeader.writeUInt32LE(packet.payload.length, 0);
+          frameHeader.writeBigUInt64LE(BigInt(packet.timestamp), 4);
+          ivfStream.write(frameHeader);
+          ivfStream.write(packet.payload);
+        }
+      } catch (error) {
+        console.error(
+          `Error processing video RTP packet for ${clientId}:`,
+          error,
+        );
       }
+    };
+
+    // Start HLS processing after receiving first packets
+    setTimeout(() => {
+      this.startHLSProcessing(clientId);
+    }, 2000);
+  }
+
+  private setupAudioProcessing(clientId: string, track: any) {
+    const client = this.clients.get(clientId);
+    if (!client) return;
+
+    const audioPath = path.join(this.outputDir, clientId, "audio.ogg");
+    const audioStream = createWriteStream(audioPath);
+
+    client.mediaStreams.audio = audioStream;
+
+    // Process audio RTP packets
+    track.onReceiveRtp = (packet: any) => {
+      try {
+        // Write OGG format for Opus audio
+        audioStream.write(packet.payload);
+      } catch (error) {
+        console.error(
+          `Error processing audio RTP packet for ${clientId}:`,
+          error,
+        );
+      }
+    };
+  }
+
+  private startHLSProcessing(clientId: string) {
+    const client = this.clients.get(clientId);
+    if (!client || client.ffmpegProcess) return;
+
+    const inputDir = path.join(this.outputDir, clientId);
+    const videoPath = path.join(inputDir, "video.h264");
+    const audioPath = path.join(inputDir, "audio.ogg");
+    const hlsPath = path.join(this.hlsDir, "playlist.m3u8");
+
+    // Check if we have multiple clients for composite stream
+    const activeClients = Array.from(this.clients.values()).filter(
+      (c) => c.peerConnection,
+    );
+
+    if (activeClients.length >= 2) {
+      this.createCompositeHLSStream();
+    } else {
+      this.createSingleClientHLSStream(clientId, videoPath, audioPath, hlsPath);
     }
   }
 
-  const ffmpegArgs = [
-    ...inputs,
-    "-filter_complex",
-    filterComplexParts.join(";"),
-  ];
+  private createSingleClientHLSStream(
+    clientId: string,
+    videoPath: string,
+    audioPath: string,
+    hlsPath: string,
+  ) {
+    const client = this.clients.get(clientId);
+    if (!client) return;
 
-  if (videoMapsOut.length > 0) {
-    ffmpegArgs.push(
+    const ffmpegArgs = [
+      "-re", // Read input at native frame rate
+      "-i",
+      videoPath,
+      "-i",
+      audioPath,
+      "-c:v",
+      "libx264", // Re-encode video for HLS compatibility
+      "-preset",
+      "ultrafast",
+      "-tune",
+      "zerolatency",
+      "-c:a",
+      "aac", // Re-encode audio for HLS
+      "-b:a",
+      "128k",
+      "-f",
+      "hls",
+      "-hls_time",
+      "2", // 2-second segments
+      "-hls_list_size",
+      "10",
+      "-hls_flags",
+      "delete_segments",
+      "-hls_allow_cache",
+      "0",
+      hlsPath,
+    ];
+
+    client.ffmpegProcess = spawn("ffmpeg", ffmpegArgs, {
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    client.ffmpegProcess.on("error", (error) => {
+      console.error(`FFmpeg error for ${clientId}:`, error);
+    });
+
+    client.ffmpegProcess.on("exit", (code) => {
+      console.log(`FFmpeg process for ${clientId} exited with code ${code}`);
+    });
+
+    console.log(`Started HLS processing for client ${clientId}`);
+  }
+
+  private createCompositeHLSStream() {
+    // Create composite stream from multiple clients
+    const activeClients = Array.from(this.clients.entries()).filter(
+      ([_, c]) => c.peerConnection,
+    );
+
+    if (activeClients.length < 2) return;
+
+    const [client1, client2] = activeClients.slice(0, 2);
+    const [id1, connection1] = client1;
+    const [id2, connection2] = client2;
+
+    const video1Path = path.join(this.outputDir, id1, "video.h264");
+    const video2Path = path.join(this.outputDir, id2, "video.h264");
+    const audio1Path = path.join(this.outputDir, id1, "audio.ogg");
+    const compositeHlsPath = path.join(this.hlsDir, "playlist.m3u8");
+
+    // FFmpeg command for side-by-side composite
+    const ffmpegArgs = [
+      "-re",
+      "-i",
+      video1Path,
+      "-i",
+      video2Path,
+      "-i",
+      audio1Path,
+      "-filter_complex",
+      "[0:v][1:v]hstack=inputs=2[v]", // Side-by-side video
       "-map",
-      "[vout]",
+      "[v]",
+      "-map",
+      "2:a", // Use audio from first client
       "-c:v",
       "libx264",
       "-preset",
       "ultrafast",
       "-tune",
       "zerolatency",
-      "-g",
-      "25",
-      "-r",
-      "25",
-    );
-  }
-  if (audioMapsOut.length > 0) {
-    ffmpegArgs.push(
-      "-map",
-      "[aout]",
       "-c:a",
       "aac",
       "-b:a",
       "128k",
-      "-ar",
-      "44100",
-    );
+      "-f",
+      "hls",
+      "-hls_time",
+      "2",
+      "-hls_list_size",
+      "10",
+      "-hls_flags",
+      "delete_segments",
+      "-hls_allow_cache",
+      "0",
+      compositeHlsPath,
+    ];
+
+    const compositeProcess = spawn("ffmpeg", ffmpegArgs);
+
+    compositeProcess.on("error", (error) => {
+      console.error("Composite FFmpeg error:", error);
+    });
+
+    compositeProcess.on("exit", (code) => {
+      console.log(`Composite FFmpeg process exited with code ${code}`);
+    });
+
+    console.log("Started composite HLS stream processing");
   }
 
-  if (videoMapsOut.length === 0 && audioMapsOut.length === 0) {
-    console.log("[FFmpeg] No streams to map. Aborting FFmpeg launch.");
-    return;
-  }
+  private handleClientDisconnect(clientId: string) {
+    const client = this.clients.get(clientId);
+    if (!client) return;
 
-  ffmpegArgs.push(
-    "-f",
-    "hls",
-    "-hls_time",
-    "2",
-    "-hls_list_size",
-    "5",
-    "-hls_flags",
-    "delete_segments+omit_endlist",
-    "-hls_segment_filename",
-    segmentPath,
-    outputPath,
-  );
+    console.log(`Client ${clientId} disconnected`);
 
-  console.log("[FFmpeg] Starting FFmpeg with args:", ffmpegArgs.join(" "));
-  try {
-    ffmpegProcess = spawn("ffmpeg", ffmpegArgs);
+    // Close peer connection
+    if (client.peerConnection) {
+      client.peerConnection.close();
+    }
 
-    ffmpegProcess.stdout.on("data", (data: Buffer) =>
-      console.log(`FFmpeg stdout: ${data.toString().trim()}`),
-    );
-    ffmpegProcess.stderr.on("data", (data: Buffer) =>
-      console.error(`FFmpeg stderr: ${data.toString().trim()}`),
-    );
-    ffmpegProcess.on("close", (code: number | null) => {
-      console.log(`FFmpeg process exited with code ${code}`);
-      if (code !== 0 && code !== null) {
-        console.error("FFmpeg process crashed or had an error.");
+    // Close media streams
+    Object.values(client.mediaStreams).forEach((stream) => {
+      if (stream && typeof stream.end === "function") {
+        stream.end();
       }
-      ffmpegProcess = null;
     });
-    ffmpegProcess.on("error", (err: Error) => {
-      console.error("Failed to start FFmpeg process:", err);
-      ffmpegProcess = null;
+
+    // Kill FFmpeg process
+    if (client.ffmpegProcess) {
+      client.ffmpegProcess.kill("SIGTERM");
+    }
+
+    // Remove from clients map
+    this.clients.delete(clientId);
+
+    // Notify other clients
+    this.clients.forEach((otherClient, otherClientId) => {
+      if (otherClient.ws.readyState === WebSocket.OPEN) {
+        otherClient.ws.send(
+          JSON.stringify({
+            type: "peer-disconnected",
+            payload: { clientId },
+          }),
+        );
+      }
     });
-  } catch (error) {
-    console.error("Error spawning FFmpeg:", error);
-    ffmpegProcess = null;
   }
 }
 
-wss.on("connection", (ws, req) => {
-  const requestUrl = req.url
-    ? new URL(req.url, `ws://${req.headers.host}`)
-    : null;
-  const clientId = requestUrl?.searchParams.get("clientId");
-
-  if (!clientId || requestUrl?.pathname !== WSS_PATH) {
-    ws.close(1008, "ClientId required or wrong path.");
-    return;
-  }
-  if (clients.has(clientId)) {
-    ws.close(1008, "Client ID already connected.");
-    return;
-  }
-  clients.set(clientId, ws);
-  console.log(
-    `Client ${clientId.substring(0, 8)} connected. Total clients: ${clients.size}`,
-  );
-
-  ws.on("message", async (messageBuffer) => {
-    const messageString = messageBuffer.toString();
-    let parsedMessage: SignalingMessage;
-    try {
-      parsedMessage = JSON.parse(messageString);
-    } catch (error) {
-      console.error(
-        `Failed to parse message from ${clientId.substring(0, 8)}:`,
-        messageString,
-        error,
-      );
-      return;
-    }
-
-    const fromPeerID = clientId;
-    console.log(
-      `Received from ${fromPeerID.substring(0, 8)}: ${parsedMessage.type}`,
-    );
-
-    switch (parsedMessage.type) {
-      case "signal-initiate-p2p":
-        console.log(
-          `Client ${fromPeerID.substring(0, 8)} initiated P2P. Broadcasting to others.`,
-        );
-        for (const [otherClientId, otherClientWs] of clients) {
-          if (
-            otherClientId !== fromPeerID &&
-            otherClientWs.readyState === WebSocket.OPEN
-          ) {
-            otherClientWs.send(
-              JSON.stringify({
-                type: "signal-initiate-p2p",
-                payload: { fromPeerID },
-              }),
-            );
-            ws.send(
-              JSON.stringify({
-                type: "signal-initiate-p2p",
-                payload: { fromPeerID: otherClientId },
-              }),
-            );
-          }
-        }
-        break;
-
-      case "direct-offer":
-      case "direct-answer":
-      case "direct-candidate": {
-        const directPayload = parsedMessage.payload as DirectSignalPayload;
-        const targetPeerId = directPayload.toPeerID;
-        if (targetPeerId) {
-          const targetWs = clients.get(targetPeerId);
-          if (targetWs && targetWs.readyState === WebSocket.OPEN) {
-            const relayedMessage: SignalingMessage = {
-              type: parsedMessage.type,
-              payload: { ...directPayload, fromPeerID },
-            };
-            targetWs.send(JSON.stringify(relayedMessage));
-          } else {
-            console.warn(
-              `Could not relay ${parsedMessage.type} to ${targetPeerId.substring(0, 8)}: Target not found/open.`,
-            );
-          }
-        }
-        break;
-      }
-      case "client-offer-for-server": {
-        console.log(
-          `[ServerRTC] Received offer from ${fromPeerID.substring(0, 8)} to stream to server.`,
-        );
-        const pc = new wrtc.RTCPeerConnection({
-          iceServers: [
-            {
-              urls: "stun:stun.l.google.com:19302",
-            },
-          ],
-        });
-        const peerCtx: ServerPeerContext = {
-          pc,
-          clientId: fromPeerID,
-          hasAudio: false,
-          hasVideo: false,
-        };
-        serverRtcPeers.set(fromPeerID, peerCtx);
-
-        pc.onicecandidate = (event) => {
-          if (event.candidate) {
-            ws.send(
-              JSON.stringify({
-                type: "server-candidate-for-client",
-                payload: { candidate: event.candidate.toJSON() },
-              } as SignalingMessage),
-            );
-          }
-        };
-
-        pc.ontrack = (event) => {
-          console.log(
-            `[ServerRTC] Received track ${event.track.kind} from ${fromPeerID.substring(0, 8)}`,
-          );
-
-          if (event.track.kind === "video") {
-            peerCtx.hasVideo = true;
-            peerCtx.videoFile = path.join(
-              HLS_OUTPUT_DIR,
-              `${fromPeerID}_video.h264`,
-            );
-            console.log(
-              `[ServerRTC] Placeholder for writing video from ${fromPeerID.substring(0, 8)} to ${peerCtx.videoFile}`,
-            );
-            fs.closeSync(fs.openSync(peerCtx.videoFile, "w"));
-          } else if (event.track.kind === "audio") {
-            peerCtx.hasAudio = true;
-            peerCtx.audioFile = path.join(
-              HLS_OUTPUT_DIR,
-              `${fromPeerID}_audio.ogg`,
-            );
-            console.log(
-              `[ServerRTC] Placeholder for writing audio from ${fromPeerID.substring(0, 8)} to ${peerCtx.audioFile}`,
-            );
-            fs.closeSync(fs.openSync(peerCtx.audioFile, "w"));
-          }
-
-          if (peerCtx.hasAudio || peerCtx.hasVideo) {
-            setTimeout(startOrUpdateFFmpeg, 1000);
-          }
-        };
-
-        pc.oniceconnectionstatechange = () => {
-          console.log(
-            `[ServerRTC] Peer ${fromPeerID.substring(0, 8)} ICE state: ${pc.iceConnectionState}`,
-          );
-          if (
-            pc.iceConnectionState === "disconnected" ||
-            pc.iceConnectionState === "closed" ||
-            pc.iceConnectionState === "failed"
-          ) {
-            pc.close();
-            serverRtcPeers.delete(fromPeerID);
-            if (peerCtx.videoFile && fs.existsSync(peerCtx.videoFile))
-              fs.unlinkSync(peerCtx.videoFile);
-            if (peerCtx.audioFile && fs.existsSync(peerCtx.audioFile))
-              fs.unlinkSync(peerCtx.audioFile);
-            console.log(
-              `[ServerRTC] Cleaned up for ${fromPeerID.substring(0, 8)}.`,
-            );
-            startOrUpdateFFmpeg();
-          }
-        };
-
-        try {
-          if (!parsedMessage.payload.sdp)
-            throw new Error("Offer SDP missing for server connection");
-          await pc.setRemoteDescription(
-            parsedMessage.payload.sdp as wrtc.RTCSessionDescription,
-          );
-          const answer = await pc.createAnswer();
-          await pc.setLocalDescription(answer);
-          ws.send(
-            JSON.stringify({
-              type: "server-answer-for-client",
-              payload: { sdp: pc.localDescription?.toJSON() },
-            } as SignalingMessage),
-          );
-        } catch (e) {
-          console.error(
-            `[ServerRTC] Error handling offer from ${fromPeerID.substring(0, 8)}:`,
-            e,
-          );
-          pc.close();
-          serverRtcPeers.delete(fromPeerID);
-        }
-        break;
-      }
-
-      case "client-candidate-for-server": {
-        const peerCtx = serverRtcPeers.get(fromPeerID);
-        if (peerCtx && parsedMessage.payload.candidate) {
-          try {
-            await peerCtx.pc.addIceCandidate(
-              parsedMessage.payload.candidate as
-                | wrtc.RTCIceCandidate
-                | wrtc.RTCIceCandidate,
-            );
-          } catch (e) {
-            console.error(
-              `[ServerRTC] Error adding ICE candidate from ${fromPeerID.substring(0, 8)}:`,
-              e,
-            );
-          }
-        }
-        break;
-      }
-      default:
-        console.warn(
-          `Received unknown message type from ${fromPeerID.substring(0, 8)}:`,
-          parsedMessage.type,
-        );
-    }
-  });
-
-  ws.on("close", () => {
-    clients.delete(clientId);
-    const peerCtx = serverRtcPeers.get(clientId);
-    if (peerCtx) {
-      peerCtx.pc.close();
-      serverRtcPeers.delete(clientId);
-      if (peerCtx.videoFile && fs.existsSync(peerCtx.videoFile))
-        fs.unlinkSync(peerCtx.videoFile);
-      if (peerCtx.audioFile && fs.existsSync(peerCtx.audioFile))
-        fs.unlinkSync(peerCtx.audioFile);
-      console.log(
-        `[ServerRTC] Cleaned up for disconnected client ${clientId.substring(0, 8)}.`,
-      );
-    }
-    console.log(
-      `Client ${clientId.substring(0, 8)} disconnected. Total clients: ${clients.size}`,
-    );
-    startOrUpdateFFmpeg();
-  });
-
-  ws.onerror = (error) =>
-    console.error(
-      `WebSocket error for client ${clientId.substring(0, 8)}:`,
-      error,
-    );
-});
-
-wss.on("error", (error) => console.error("WebSocket Server Error:", error));
-
-function gracefulShutdown() {
-  console.log("Graceful shutdown initiated...");
-  if (ffmpegProcess) {
-    console.log("Stopping FFmpeg process...");
-    ffmpegProcess.kill("SIGINT");
-  }
-  for (const client of wss.clients) {
-    if (client.readyState === WebSocket.OPEN)
-      client.close(1001, "Server shutting down");
-  }
-  for (const [_, ctx] of serverRtcPeers) {
-    ctx.pc.close();
-  }
-  serverRtcPeers.clear();
-  wss.close(() => {
-    console.log("WebSocket Server shut down.");
-    const files = fs.readdirSync(HLS_OUTPUT_DIR);
-
-    for (const f of files) {
-      try {
-        fs.unlinkSync(path.join(HLS_OUTPUT_DIR, f));
-      } catch (e) {
-        console.error(e);
-      }
-    }
-    fs.rmdirSync(HLS_OUTPUT_DIR, { recursive: true });
-    console.log("Cleaned HLS output directory.");
-    process.exit(0);
-  });
-}
-process.on("SIGINT", gracefulShutdown);
-process.on("SIGTERM", gracefulShutdown);
+const server = new WebRTCSignalingServer();
+console.log("WebRTC Signaling Server with Media Processing started");
+console.log("WebSocket: ws://localhost:8080/ws/stream");
+console.log("HLS Stream: http://localhost:8081/hls/playlist.m3u8");

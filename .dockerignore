@@ -1,6 +1,7 @@
+hls/
 .git/
 dist/
+output/
 .github/
 .gitignore
-hls-output/
 node_modules/
