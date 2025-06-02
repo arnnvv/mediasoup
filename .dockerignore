@@ -1,0 +1,8 @@
+hls/
+.git/
+dist/
+output/
+server/
+.github/
+.gitignore
+node_modules/
