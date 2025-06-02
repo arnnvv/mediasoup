@@ -40,6 +40,17 @@ let consumer: Consumer<AppData>;
 
 (async () => {
   worker = await createWorker({
+    logLevel: "debug",
+    logTags: [
+      "rtp",
+      "srtp",
+      "ice",
+      "rtcp",
+      "score",
+      "simulcast",
+      "sctp",
+      "message",
+    ],
     rtcMinPort: 10000,
     rtcMaxPort: 10100,
   });
@@ -48,6 +59,14 @@ let consumer: Consumer<AppData>;
   worker.on("died", () => {
     console.error("mediasoup worker has died");
     setTimeout(() => process.exit(1), 2000);
+  });
+
+  worker.on("listenererror", (eventName: string, err: Error) => {
+    console.error(`Lsten Error ${eventName}, ${err}`);
+  });
+
+  worker.observer.on("close", () => {
+    console.warn("Worker Closed");
   });
 
   return worker;
