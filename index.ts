@@ -38,6 +38,11 @@ let consumerTransport: WebRtcTransport<AppData>;
 let producer: Producer<AppData>;
 let consumer: Consumer<AppData>;
 
+const logRtpStream = (prefix: string, data: any) => {
+  const timestamp = new Date().toISOString();
+  console.log(`[${timestamp}] ${prefix}:`, JSON.stringify(data, null, 2));
+};
+
 (async () => {
   worker = await createWorker({
     logLevel: "debug",
@@ -62,7 +67,7 @@ let consumer: Consumer<AppData>;
   });
 
   worker.on("listenererror", (eventName: string, err: Error) => {
-    console.error(`Lsten Error ${eventName}, ${err}`);
+    console.error(`Listen Error ${eventName}, ${err}`);
   });
 
   worker.observer.on("close", () => {
@@ -72,8 +77,6 @@ let consumer: Consumer<AppData>;
   return worker;
 })();
 
-// https://mediasoup.org/documentation/v3/mediasoup/rtp-parameters-and-capabilities/#RtpCodecCapability
-// https://github.com/versatica/mediasoup/blob/v3/src/supportedRtpCapabilities.ts
 const mediaCodecs: RtpCodecCapability[] = [
   {
     kind: "audio",
@@ -103,11 +106,11 @@ peers.on("connection", async (socket) => {
 
   router = await worker.createRouter({ mediaCodecs });
 
+  logRtpStream("ROUTER_RTP_CAPABILITIES", router.rtpCapabilities);
+
   socket.on("getRtpCapabilities", (callback) => {
     const rtpCapabilities = router.rtpCapabilities;
-
-    console.log("rtp Capabilities", rtpCapabilities);
-
+    logRtpStream("GET_RTP_CAPABILITIES", rtpCapabilities);
     callback({ rtpCapabilities });
   });
 
@@ -115,29 +118,41 @@ peers.on("connection", async (socket) => {
     console.log(`Is this a sender request? ${sender}`);
     if (sender) {
       const producerTransportt = await createWebRtcTransport(callback);
-      if (producerTransportt !== undefined)
+      if (producerTransportt !== undefined) {
         producerTransport = producerTransportt;
+        setupProducerTransportLogging(producerTransport);
+      }
     } else {
       const consumerTransportt = await createWebRtcTransport(callback);
-      if (consumerTransportt !== undefined)
+      if (consumerTransportt !== undefined) {
         consumerTransport = consumerTransportt;
+        setupConsumerTransportLogging(consumerTransport);
+      }
     }
   });
 
   socket.on("transport-connect", async ({ dtlsParameters }) => {
-    console.log("maa ki chut");
-    console.log("DTLS PARAMS... ", { dtlsParameters });
+    console.log("transport-connect called");
+    logRtpStream("TRANSPORT_CONNECT_DTLS", dtlsParameters);
     await producerTransport.connect({ dtlsParameters });
   });
 
   socket.on("transport-produce", async ({ kind, rtpParameters }, callback) => {
-    console.log("In transposr produce");
+    console.log("In transport produce");
+    logRtpStream("TRANSPORT_PRODUCE_RTP_PARAMS", {
+      kind,
+      rtpParameters,
+      socketId: socket.id,
+    });
+
     producer = await producerTransport.produce({
       kind,
       rtpParameters,
     });
 
     console.log("Producer ID: ", producer.id, producer.kind);
+
+    setupProducerLogging(producer, socket.id);
 
     producer.on("transportclose", () => {
       console.log("transport for this producer closed ");
@@ -151,11 +166,18 @@ peers.on("connection", async (socket) => {
 
   socket.on("transport-recv-connect", async ({ dtlsParameters }) => {
     console.log(`DTLS PARAMS: ${dtlsParameters}`);
+    logRtpStream("TRANSPORT_RECV_CONNECT_DTLS", dtlsParameters);
     await consumerTransport.connect({ dtlsParameters });
   });
 
   socket.on("consume", async ({ rtpCapabilities }, callback) => {
     try {
+      logRtpStream("CONSUME_REQUEST", {
+        producerId: producer.id,
+        rtpCapabilities,
+        socketId: socket.id,
+      });
+
       if (
         router.canConsume({
           producerId: producer.id,
@@ -167,6 +189,8 @@ peers.on("connection", async (socket) => {
           rtpCapabilities,
           paused: true,
         });
+
+        setupConsumerLogging(consumer, socket.id);
 
         consumer.on("transportclose", () => {
           console.log("transport close from consumer");
@@ -183,6 +207,7 @@ peers.on("connection", async (socket) => {
           rtpParameters: consumer.rtpParameters,
         };
 
+        logRtpStream("CONSUME_RESPONSE_PARAMS", params);
         callback({ params });
       }
     } catch (error) {
@@ -197,13 +222,170 @@ peers.on("connection", async (socket) => {
 
   socket.on("consumer-resume", async () => {
     console.log("consumer resume");
+    logRtpStream("CONSUMER_RESUME", {
+      consumerId: consumer.id,
+      socketId: socket.id,
+    });
     await consumer.resume();
   });
 });
 
+const setupProducerLogging = (
+  producer: Producer<AppData>,
+  socketId: string,
+) => {
+  producer.on("score", (score) => {
+    logRtpStream("PRODUCER_SCORE", {
+      producerId: producer.id,
+      socketId,
+      score,
+      kind: producer.kind,
+    });
+  });
+
+  const statsInterval = setInterval(async () => {
+    try {
+      const stats = await producer.getStats();
+      logRtpStream("PRODUCER_STATS", {
+        producerId: producer.id,
+        socketId,
+        kind: producer.kind,
+        stats,
+      });
+    } catch (error) {
+      console.error("Error getting producer stats:", error);
+    }
+  }, 5000);
+
+  producer.on("@close", () => {
+    clearInterval(statsInterval);
+    logRtpStream("PRODUCER_CLOSED", {
+      producerId: producer.id,
+      socketId,
+    });
+  });
+
+  logRtpStream("PRODUCER_RTP_PARAMETERS", {
+    producerId: producer.id,
+    socketId,
+    kind: producer.kind,
+    rtpParameters: producer.rtpParameters,
+  });
+};
+
+const setupConsumerLogging = (
+  consumer: Consumer<AppData>,
+  socketId: string,
+) => {
+  consumer.on("score", (score) => {
+    logRtpStream("CONSUMER_SCORE", {
+      consumerId: consumer.id,
+      socketId,
+      score,
+      kind: consumer.kind,
+    });
+  });
+
+  const statsInterval = setInterval(async () => {
+    try {
+      const stats = await consumer.getStats();
+      logRtpStream("CONSUMER_STATS", {
+        consumerId: consumer.id,
+        socketId,
+        kind: consumer.kind,
+        stats,
+      });
+    } catch (error) {
+      console.error("Error getting consumer stats:", error);
+    }
+  }, 5000);
+
+  consumer.on("@close", () => {
+    clearInterval(statsInterval);
+    logRtpStream("CONSUMER_CLOSED", {
+      consumerId: consumer.id,
+      socketId,
+    });
+  });
+
+  logRtpStream("CONSUMER_RTP_PARAMETERS", {
+    consumerId: consumer.id,
+    socketId,
+    kind: consumer.kind,
+    rtpParameters: consumer.rtpParameters,
+  });
+};
+
+const setupProducerTransportLogging = (transport: WebRtcTransport<AppData>) => {
+  transport.on("dtlsstatechange", (dtlsState) => {
+    logRtpStream("PRODUCER_TRANSPORT_DTLS_STATE", {
+      transportId: transport.id,
+      dtlsState,
+    });
+    if (dtlsState === "closed") {
+      transport.close();
+    }
+  });
+
+  transport.on("@close", () => {
+    logRtpStream("PRODUCER_TRANSPORT_CLOSED", {
+      transportId: transport.id,
+    });
+  });
+
+  const statsInterval = setInterval(async () => {
+    try {
+      const stats = await transport.getStats();
+      logRtpStream("PRODUCER_TRANSPORT_STATS", {
+        transportId: transport.id,
+        stats,
+      });
+    } catch (error) {
+      console.error("Error getting producer transport stats:", error);
+    }
+  }, 10000);
+
+  transport.on("@close", () => {
+    clearInterval(statsInterval);
+  });
+};
+
+const setupConsumerTransportLogging = (transport: WebRtcTransport<AppData>) => {
+  transport.on("dtlsstatechange", (dtlsState) => {
+    logRtpStream("CONSUMER_TRANSPORT_DTLS_STATE", {
+      transportId: transport.id,
+      dtlsState,
+    });
+    if (dtlsState === "closed") {
+      transport.close();
+    }
+  });
+
+  transport.on("@close", () => {
+    logRtpStream("CONSUMER_TRANSPORT_CLOSED", {
+      transportId: transport.id,
+    });
+  });
+
+  const statsInterval = setInterval(async () => {
+    try {
+      const stats = await transport.getStats();
+      logRtpStream("CONSUMER_TRANSPORT_STATS", {
+        transportId: transport.id,
+        stats,
+      });
+    } catch (error) {
+      console.error("Error getting consumer transport stats:", error);
+    }
+  }, 10000);
+
+  transport.on("@close", () => {
+    clearInterval(statsInterval);
+  });
+};
+
 const createWebRtcTransport = async (callback: any) => {
   try {
-    // https://mediasoup.org/documentation/v3/mediasoup/api/#WebRtcTransportOptions
     const webRtcTransport_options = {
       listenIps: [
         {
@@ -225,11 +407,17 @@ const createWebRtcTransport = async (callback: any) => {
       iceTransportPolicy: "all",
     };
 
-    // https://mediasoup.org/documentation/v3/mediasoup/api/#router-createWebRtcTransport
     const transport = await router.createWebRtcTransport(
       webRtcTransport_options,
     );
     console.log(`transport id: ${transport.id}`);
+
+    logRtpStream("WEBRTC_TRANSPORT_CREATED", {
+      transportId: transport.id,
+      iceParameters: transport.iceParameters,
+      iceCandidates: transport.iceCandidates,
+      dtlsParameters: transport.dtlsParameters,
+    });
 
     transport.on("dtlsstatechange", (dtlsState) => {
       if (dtlsState === "closed") {
@@ -242,7 +430,6 @@ const createWebRtcTransport = async (callback: any) => {
     });
 
     callback({
-      // https://mediasoup.org/documentation/v3/mediasoup-client/api/#TransportOptions
       params: {
         id: transport.id,
         iceParameters: transport.iceParameters,
