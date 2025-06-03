@@ -1,6 +1,6 @@
 import { createServer } from "node:https";
 import { readFileSync } from "node:fs";
-import { Server as SocketIOServer, Socket } from "socket.io";
+import { Server as SocketIOServer, type Socket } from "socket.io";
 import { createWorker } from "mediasoup";
 import type {
   AppData,
@@ -159,7 +159,7 @@ peers.on("connection", async (socket: Socket) => {
     console.log(`Client disconnected: ${socket.id}`);
     const state = peerStates.get(socket.id);
     if (state) {
-      state.producers.forEach((producer) => {
+      for (const [_, producer] of state.producers) {
         if (!producer.closed) {
           logRtpStream("PRODUCER_CLOSING_ON_DISCONNECT", {
             producerId: producer.id,
@@ -168,9 +168,11 @@ peers.on("connection", async (socket: Socket) => {
           producer.close();
         }
         socket.broadcast.emit("producer-closed", { producerId: producer.id });
-      });
+      }
       state.producerTransport?.close();
-      state.consumerTransports.forEach((transport) => transport.close());
+      for (const [_, transport] of state.consumerTransports) {
+        transport.close();
+      }
     }
     peerStates.delete(socket.id);
     console.log(
@@ -344,8 +346,10 @@ peers.on("connection", async (socket: Socket) => {
             producerId: producer.id,
             socketId: socket.id,
           });
-          producer.close();
-          state.producers.delete(kind);
+          if (!producer.closed) {
+            producer.close();
+          }
+          state.producers.delete(producer.kind);
         });
 
         logRtpStream("PRODUCER_CREATED", {
@@ -490,10 +494,10 @@ peers.on("connection", async (socket: Socket) => {
             socketId: socket.id,
           });
           consumer.close();
-          state.consumers.delete(targetProducer!.id);
+          state.consumers.delete(targetProducer?.id);
           socket.emit("consumer-closed", {
             consumerId: consumer.id,
-            producerId: targetProducer!.id,
+            producerId: targetProducer?.id,
           });
         });
 
