@@ -3,7 +3,7 @@
     "b": "tsc -b",
     "f": "biome format --write .",
     "l": "biome lint --write .",
-    "d": "node dist/index.js"
+    "d": "DETAILED_LOGGING=true node dist/index.js"
   },
   "dependencies": {
     "mediasoup": "^3.8.3",
