@@ -1,6 +1,6 @@
 import { createServer } from "node:https";
 import { readFileSync } from "node:fs";
-import { Server as SocketIOServer, type Socket } from "socket.io";
+import { Server as SocketIOServer, Socket } from "socket.io";
 import { createWorker } from "mediasoup";
 import type {
   AppData,
@@ -12,6 +12,8 @@ import type {
   Worker,
   DtlsParameters,
   RtpParameters,
+  TransportTuple,
+  SctpState,
   RtpCapabilities,
 } from "mediasoup/node/lib/types";
 
@@ -48,6 +50,16 @@ const peerStates = new Map<string, PeerState>();
 
 const logRtpStream = (prefix: string, data: any) => {
   const timestamp = new Date().toISOString();
+  if (
+    prefix.endsWith("_STATS") &&
+    Object.keys(data).length > 3 &&
+    !process.env.DETAILED_LOGGING
+  ) {
+    console.log(
+      `[${timestamp}] ${prefix}: (Stats data - enable DETAILED_LOGGING to see full content)`,
+    );
+    return;
+  }
   console.log(`[${timestamp}] ${prefix}:`, JSON.stringify(data, null, 2));
 };
 
@@ -76,99 +88,144 @@ const mediaCodecs: RtpCodecCapability[] = [
       "srtp",
       "ice",
       "rtcp",
-      // "score",
-      // "simulcast",
-      // "sctp",
-      // "message",
+      "score",
+      "simulcast",
+      "sctp",
+      "message",
+      "dtls",
     ],
     rtcMinPort: 10000,
     rtcMaxPort: 10100,
   });
   console.log(`worker pid ${worker.pid}`);
 
-  worker.on("died", () => {
-    console.error("mediasoup worker has died");
+  worker.on("died", (error) => {
+    console.error("mediasoup worker has died:", error);
     setTimeout(() => process.exit(1), 2000);
   });
+  worker.observer.on("close", () => console.log("worker closed"));
+  worker.observer.on("newrouter", (router) =>
+    console.log(`new router created [id:${router.id}]`),
+  );
 
   router = await worker.createRouter({ mediaCodecs });
-  console.log("Router created");
+  console.log(`Router created [id:${router.id}]`);
   logRtpStream("ROUTER_RTP_CAPABILITIES", router.rtpCapabilities);
+  router.observer.on("close", () => console.log("router closed"));
+  router.observer.on("newtransport", (transport) => {
+    logRtpStream("ROUTER_NEW_TRANSPORT", {
+      transportId: transport.id,
+      appData: transport.appData,
+    });
+  });
 })();
 
 peers.on("connection", async (socket: Socket) => {
   console.log(`Client connected: ${socket.id}`);
-  peerStates.set(socket.id, {
+  const newPeerState: PeerState = {
     socketId: socket.id,
     consumerTransports: new Map(),
     producers: new Map(),
     consumers: new Map(),
-  });
+  };
+  peerStates.set(socket.id, newPeerState);
 
   socket.emit("connection-success", {
     socketId: socket.id,
   });
+
+  const existingProducersInfo = [];
+  for (const [peerId, state] of peerStates) {
+    if (peerId === socket.id) continue;
+    for (const [kind, producer] of state.producers) {
+      if (!producer.closed) {
+        existingProducersInfo.push({
+          producerId: producer.id,
+          producerSocketId: peerId,
+          kind: producer.kind,
+        });
+      }
+    }
+  }
+  if (existingProducersInfo.length > 0) {
+    console.log(
+      `Informing ${socket.id} about existing producers:`,
+      existingProducersInfo.length,
+    );
+    socket.emit("existing-producers", { producers: existingProducersInfo });
+  }
 
   socket.on("disconnect", () => {
     console.log(`Client disconnected: ${socket.id}`);
     const state = peerStates.get(socket.id);
     if (state) {
       state.producers.forEach((producer) => {
-        producer.close();
+        if (!producer.closed) {
+          logRtpStream("PRODUCER_CLOSING_ON_DISCONNECT", {
+            producerId: producer.id,
+            socketId: socket.id,
+          });
+          producer.close();
+        }
         socket.broadcast.emit("producer-closed", { producerId: producer.id });
       });
       state.producerTransport?.close();
       state.consumerTransports.forEach((transport) => transport.close());
     }
     peerStates.delete(socket.id);
+    console.log(
+      `Peer state for ${socket.id} deleted. Remaining peers: ${peerStates.size}`,
+    );
   });
 
   socket.on("getRtpCapabilities", (callback) => {
-    logRtpStream(
-      `GET_RTP_CAPABILITIES for ${socket.id}`,
-      router.rtpCapabilities,
-    );
+    logRtpStream(`GET_RTP_CAPABILITIES for ${socket.id}`, {
+      caps: router.rtpCapabilities,
+    });
     callback({ rtpCapabilities: router.rtpCapabilities });
   });
 
   socket.on(
     "createWebRtcTransport",
     async ({ sender }: { sender: boolean }, callback) => {
-      console.log(`createWebRtcTransport for ${socket.id}, sender: ${sender}`);
+      logRtpStream("CREATE_WEBRTC_TRANSPORT_REQUEST", {
+        socketId: socket.id,
+        sender,
+      });
       const state = peerStates.get(socket.id);
-      if (!state) {
-        return callback({ error: "Peer state not found" });
-      }
+      if (!state) return callback({ error: "Peer state not found" });
 
       try {
-        const transport = await createWebRtcTransportInternal(socket.id);
+        if (!sender) {
+          const existingConsumerTransport =
+            state.consumerTransports.get("default");
+          if (existingConsumerTransport && !existingConsumerTransport.closed) {
+            logRtpStream("REUSING_CONSUMER_TRANSPORT", {
+              socketId: socket.id,
+              transportId: existingConsumerTransport.id,
+            });
+            callback({
+              params: {
+                id: existingConsumerTransport.id,
+                iceParameters: existingConsumerTransport.iceParameters,
+                iceCandidates: existingConsumerTransport.iceCandidates,
+                dtlsParameters: existingConsumerTransport.dtlsParameters,
+              },
+            });
+            return;
+          }
+        }
+
+        const transport = await createWebRtcTransportInternal(
+          socket.id,
+          sender,
+        );
         if (sender) {
           state.producerTransport = transport;
           setupTransportLogging(transport, "PRODUCER_TRANSPORT", socket.id);
         } else {
-          if (state.consumerTransports.size === 0) {
-            state.consumerTransports.set("default", transport);
-            setupTransportLogging(transport, "CONSUMER_TRANSPORT", socket.id);
-          } else {
-            const existingConsumerTransport =
-              state.consumerTransports.get("default");
-            if (
-              existingConsumerTransport &&
-              !existingConsumerTransport.closed
-            ) {
-              callback({
-                params: {
-                  id: existingConsumerTransport.id,
-                  iceParameters: existingConsumerTransport.iceParameters,
-                  iceCandidates: existingConsumerTransport.iceCandidates,
-                  dtlsParameters: existingConsumerTransport.dtlsParameters,
-                },
-              });
-              return;
-            }
-            state.consumerTransports.set("default", transport);
-            setupTransportLogging(transport, "CONSUMER_TRANSPORT", socket.id);
-          }
+          state.consumerTransports.set("default", transport);
+          setupTransportLogging(transport, "CONSUMER_TRANSPORT", socket.id);
         }
 
         callback({
@@ -180,7 +237,10 @@ peers.on("connection", async (socket: Socket) => {
           },
         });
       } catch (error) {
-        console.error("Error creating WebRTC transport:", error);
+        logRtpStream("CREATE_WEBRTC_TRANSPORT_ERROR", {
+          socketId: socket.id,
+          error: (error as Error).message,
+        });
         callback({ error: (error as Error).message });
       }
     },
@@ -192,9 +252,10 @@ peers.on("connection", async (socket: Socket) => {
       transportId,
       dtlsParameters,
     }: { transportId: string; dtlsParameters: DtlsParameters }) => {
-      console.log(
-        `transport-connect for ${socket.id}, transportId: ${transportId}`,
-      );
+      logRtpStream("TRANSPORT_CONNECT_REQUEST", {
+        socketId: socket.id,
+        transportId,
+      });
       const state = peerStates.get(socket.id);
       if (!state) return;
 
@@ -204,18 +265,25 @@ peers.on("connection", async (socket: Socket) => {
           : state.consumerTransports.get("default");
 
       if (!transport) {
-        console.error(`Transport ${transportId} not found for ${socket.id}`);
+        logRtpStream("TRANSPORT_CONNECT_ERROR_NOT_FOUND", {
+          socketId: socket.id,
+          transportId,
+        });
         return;
       }
 
       try {
         await transport.connect({ dtlsParameters });
-        logRtpStream(
-          `TRANSPORT_CONNECT_DTLS for ${transportId}`,
-          dtlsParameters,
-        );
+        logRtpStream("TRANSPORT_CONNECT_DTLS_SUCCESS", {
+          transportId,
+          dtlsParameters: transport.dtlsParameters,
+        });
       } catch (error) {
-        console.error("Error connecting transport:", error);
+        logRtpStream("TRANSPORT_CONNECT_ERROR", {
+          socketId: socket.id,
+          transportId,
+          error: (error as Error).message,
+        });
       }
     },
   );
@@ -236,14 +304,29 @@ peers.on("connection", async (socket: Socket) => {
       },
       callback,
     ) => {
-      console.log(`transport-produce for ${socket.id}, kind: ${kind}`);
+      logRtpStream("TRANSPORT_PRODUCE_REQUEST", {
+        socketId: socket.id,
+        kind,
+        transportId,
+      });
       const state = peerStates.get(socket.id);
       if (
         !state ||
         !state.producerTransport ||
         state.producerTransport.id !== transportId
       ) {
+        logRtpStream("TRANSPORT_PRODUCE_ERROR_NO_TRANSPORT", {
+          socketId: socket.id,
+          transportId,
+        });
         return callback({ error: "Producer transport not found or mismatch" });
+      }
+      if (state.producers.has(kind) && !state.producers.get(kind)?.closed) {
+        logRtpStream("TRANSPORT_PRODUCE_ERROR_ALREADY_PRODUCING", {
+          socketId: socket.id,
+          kind,
+        });
+        return callback({ error: `Already producing ${kind}` });
       }
 
       try {
@@ -257,12 +340,19 @@ peers.on("connection", async (socket: Socket) => {
         setupProducerLogging(producer, socket.id);
 
         producer.on("transportclose", () => {
-          console.log(`Transport for producer ${producer.id} closed`);
+          logRtpStream("PRODUCER_TRANSPORT_CLOSE_EVENT", {
+            producerId: producer.id,
+            socketId: socket.id,
+          });
           producer.close();
           state.producers.delete(kind);
         });
 
-        console.log(`Producer created: ${producer.id} by ${socket.id}`);
+        logRtpStream("PRODUCER_CREATED", {
+          producerId: producer.id,
+          socketId: socket.id,
+          kind,
+        });
         callback({ id: producer.id });
 
         socket.broadcast.emit("new-producer", {
@@ -270,8 +360,33 @@ peers.on("connection", async (socket: Socket) => {
           producerSocketId: socket.id,
           kind: producer.kind,
         });
+
+        const otherProducersInfo = [];
+        for (const [peerId, peerState] of peerStates) {
+          if (peerId === socket.id) continue;
+          for (const [existingKind, existingProducer] of peerState.producers) {
+            if (!existingProducer.closed) {
+              otherProducersInfo.push({
+                producerId: existingProducer.id,
+                producerSocketId: peerId,
+                kind: existingProducer.kind,
+              });
+            }
+          }
+        }
+        if (otherProducersInfo.length > 0) {
+          logRtpStream("INFORMING_NEW_PRODUCER_ABOUT_OTHERS", {
+            socketId: socket.id,
+            count: otherProducersInfo.length,
+          });
+          socket.emit("existing-producers", { producers: otherProducersInfo });
+        }
       } catch (error) {
-        console.error("Error producing:", error);
+        logRtpStream("TRANSPORT_PRODUCE_ERROR", {
+          socketId: socket.id,
+          kind,
+          error: (error as Error).message,
+        });
         callback({ error: (error as Error).message });
       }
     },
@@ -291,71 +406,114 @@ peers.on("connection", async (socket: Socket) => {
       },
       callback,
     ) => {
-      console.log(
-        `consume request from ${socket.id} for producer ${producerId}`,
-      );
+      logRtpStream("CONSUME_REQUEST", {
+        socketId: socket.id,
+        producerId,
+        consumerTransportId,
+      });
       const state = peerStates.get(socket.id);
       const consumerTransport = state?.consumerTransports.get("default");
 
       if (
         !state ||
         !consumerTransport ||
-        consumerTransport.id !== consumerTransportId
+        consumerTransport.id !== consumerTransportId ||
+        consumerTransport.closed
       ) {
-        return callback({ error: "Consumer transport not found or mismatch" });
+        logRtpStream("CONSUME_ERROR_NO_TRANSPORT", {
+          socketId: socket.id,
+          consumerTransportId,
+        });
+        return callback({
+          error: "Consumer transport not found, mismatch, or closed",
+        });
       }
 
       let targetProducer: Producer | undefined;
-      for (const peerState of peerStates.values()) {
+      let producerSocketId: string | undefined;
+      for (const [peerId, peerState] of peerStates) {
         targetProducer = Array.from(peerState.producers.values()).find(
           (p) => p.id === producerId,
         );
-        if (targetProducer) break;
+        if (targetProducer) {
+          producerSocketId = peerId;
+          break;
+        }
       }
 
       if (!targetProducer || targetProducer.closed) {
+        logRtpStream("CONSUME_ERROR_PRODUCER_NOT_FOUND", {
+          socketId: socket.id,
+          producerId,
+        });
         return callback({
           error: `Producer ${producerId} not found or closed`,
         });
       }
 
-      if (!router.canConsume({ producerId, rtpCapabilities })) {
-        return callback({ error: "Cannot consume this producer" });
+      if (
+        !router.canConsume({ producerId: targetProducer.id, rtpCapabilities })
+      ) {
+        logRtpStream("CONSUME_ERROR_CANNOT_CONSUME", {
+          socketId: socket.id,
+          producerId,
+        });
+        return callback({
+          error: "Cannot consume this producer with provided RTP capabilities",
+        });
       }
 
       try {
         const consumer = await consumerTransport.consume({
-          producerId,
+          producerId: targetProducer.id,
           rtpCapabilities,
           paused: true,
+          appData: {
+            peerId: socket.id,
+            producerSocketId,
+            kind: targetProducer.kind,
+          },
         });
-        state.consumers.set(producerId, consumer);
+        state.consumers.set(targetProducer.id, consumer);
 
         setupConsumerLogging(consumer, socket.id);
 
         consumer.on("transportclose", () => {
-          console.log(`Transport for consumer ${consumer.id} closed`);
+          logRtpStream("CONSUMER_TRANSPORT_CLOSE_EVENT", {
+            consumerId: consumer.id,
+            socketId: socket.id,
+          });
         });
         consumer.on("producerclose", () => {
-          console.log(`Producer for consumer ${consumer.id} closed`);
+          logRtpStream("CONSUMER_PRODUCER_CLOSE_EVENT", {
+            consumerId: consumer.id,
+            socketId: socket.id,
+          });
           consumer.close();
-          state.consumers.delete(producerId);
+          state.consumers.delete(targetProducer!.id);
           socket.emit("consumer-closed", {
             consumerId: consumer.id,
-            producerId,
+            producerId: targetProducer!.id,
           });
         });
 
         const params = {
           id: consumer.id,
-          producerId: producerId,
+          producerId: targetProducer.id,
           kind: consumer.kind,
           rtpParameters: consumer.rtpParameters,
         };
-        logRtpStream(`CONSUME_RESPONSE_PARAMS for ${socket.id}`, params);
+        logRtpStream("CONSUME_RESPONSE_PARAMS", {
+          socketId: socket.id,
+          params,
+        });
         callback({ params });
       } catch (error) {
-        console.error("Error consuming:", error);
+        logRtpStream("CONSUME_ERROR", {
+          socketId: socket.id,
+          producerId,
+          error: (error as Error).message,
+        });
         callback({ error: (error as Error).message });
       }
     },
@@ -364,69 +522,59 @@ peers.on("connection", async (socket: Socket) => {
   socket.on(
     "consumer-resume",
     async ({ consumerId }: { consumerId: string }) => {
-      console.log(
-        `consumer-resume for ${socket.id}, consumerId: ${consumerId}`,
-      );
+      logRtpStream("CONSUMER_RESUME_REQUEST", {
+        socketId: socket.id,
+        consumerId,
+      });
       const state = peerStates.get(socket.id);
       if (!state) return;
 
       const consumer = Array.from(state.consumers.values()).find(
         (c) => c.id === consumerId,
       );
-      if (consumer) {
+      if (consumer && !consumer.closed) {
         try {
           await consumer.resume();
-          logRtpStream(`CONSUMER_RESUMED ${consumer.id}`, {
-            socketId: socket.id,
-          });
+          logRtpStream("CONSUMER_RESUMED", { consumerId, socketId: socket.id });
         } catch (error) {
-          console.error("Error resuming consumer:", error);
+          logRtpStream("CONSUMER_RESUME_ERROR", {
+            consumerId,
+            socketId: socket.id,
+            error: (error as Error).message,
+          });
         }
       } else {
-        console.warn(
-          `Consumer ${consumerId} not found for resume by ${socket.id}`,
-        );
+        logRtpStream("CONSUMER_RESUME_ERROR_NOT_FOUND", {
+          consumerId,
+          socketId: socket.id,
+        });
       }
     },
   );
 });
 
-const createWebRtcTransportInternal = async (socketId: string) => {
+const createWebRtcTransportInternal = async (
+  socketId: string,
+  isProducer: boolean,
+) => {
   const webRtcTransport_options = {
-    listenIps: [
-      {
-        ip: "0.0.0.0",
-        announcedIp: "127.0.0.1",
-      },
-    ],
+    listenIps: [{ ip: "0.0.0.0", announcedIp: "127.0.0.1" }],
     enableUdp: true,
     enableTcp: true,
     preferUdp: true,
-    // iceServers: [
-    //   { urls: "stun:stun.l.google.com:19302" },
-    // ],
-    initialAvailableOutgoingBitrate: 1000000,
+    initialAvailableOutgoingBitrate: isProducer ? 1000000 : undefined,
+    appData: { peerId: socketId, isProducer },
   };
 
   const transport = await router.createWebRtcTransport(webRtcTransport_options);
-  logRtpStream(`WEBRTC_TRANSPORT_CREATED for ${socketId}`, {
+  logRtpStream("WEBRTC_TRANSPORT_CREATED_INTERNAL", {
+    socketId,
     transportId: transport.id,
+    isProducer,
     iceParameters: transport.iceParameters,
-    iceCandidates: transport.iceCandidates,
-    dtlsParameters: transport.dtlsParameters,
+    // iceCandidates: transport.iceCandidates,
+    dtlsParameters: transport.dtlsParameters.role,
   });
-
-  transport.on("dtlsstatechange", (dtlsState) => {
-    if (dtlsState === "failed" || dtlsState === "closed") {
-      console.warn(
-        `DTLS state changed to ${dtlsState} for transport ${transport.id}, closing.`,
-      );
-      transport.close();
-    }
-  });
-
-  // transport.on('@close', () => console.log(`Transport ${transport.id} closed`));
-
   return transport;
 };
 
@@ -434,21 +582,65 @@ const setupProducerLogging = (
   producer: Producer<AppData>,
   socketId: string,
 ) => {
-  console.log(`Setting up logging for Producer ${producer.id} by ${socketId}`);
+  logRtpStream("PRODUCER_LOGGING_SETUP", {
+    producerId: producer.id,
+    socketId,
+    kind: producer.kind,
+  });
   producer.on("score", (score) =>
     logRtpStream("PRODUCER_SCORE", {
       producerId: producer.id,
       socketId,
+      kind: producer.kind,
       score,
     }),
   );
-  // producer.on("videoorientationchange", (orientation) => logRtpStream("PRODUCER_VIDEO_ORIENTATION", { producerId: producer.id, socketId, orientation }));
-  // producer.on("trace", (trace) => logRtpStream("PRODUCER_TRACE", { producerId: producer.id, socketId, trace }));
+  producer.on("videoorientationchange", (orientation) =>
+    logRtpStream("PRODUCER_VIDEO_ORIENTATION", {
+      producerId: producer.id,
+      socketId,
+      orientation,
+    }),
+  );
+  producer.on("trace", (trace) =>
+    logRtpStream("PRODUCER_TRACE", {
+      producerId: producer.id,
+      socketId,
+      type: trace.type,
+      kind: producer.kind,
+    }),
+  );
 
-  // const statsInterval = setInterval(async () => { }, 5000);
+  const statsInterval = setInterval(async () => {
+    if (producer.closed) {
+      clearInterval(statsInterval);
+      return;
+    }
+    try {
+      const stats = await producer.getStats();
+      logRtpStream("PRODUCER_STATS", {
+        producerId: producer.id,
+        socketId,
+        kind: producer.kind,
+        stats,
+      });
+    } catch (error) {
+      /* console.error(`Error getting producer ${producer.id} stats:`, error); */
+    }
+  }, 15000);
+
   producer.on("@close", () => {
-    // clearInterval(statsInterval);
-    logRtpStream("PRODUCER_CLOSED", { producerId: producer.id, socketId });
+    clearInterval(statsInterval);
+    logRtpStream("PRODUCER_INTERNAL_CLOSE", {
+      producerId: producer.id,
+      socketId,
+    });
+  });
+  producer.observer.on("close", () => {
+    logRtpStream("PRODUCER_OBSERVER_CLOSE", {
+      producerId: producer.id,
+      socketId,
+    });
   });
 };
 
@@ -456,21 +648,72 @@ const setupConsumerLogging = (
   consumer: Consumer<AppData>,
   socketId: string,
 ) => {
-  console.log(`Setting up logging for Consumer ${consumer.id} for ${socketId}`);
+  logRtpStream("CONSUMER_LOGGING_SETUP", {
+    consumerId: consumer.id,
+    socketId,
+    kind: consumer.kind,
+    producerId: consumer.producerId,
+  });
   consumer.on("score", (score) =>
     logRtpStream("CONSUMER_SCORE", {
       consumerId: consumer.id,
       socketId,
+      kind: consumer.kind,
       score,
     }),
   );
-  // consumer.on("trace", (trace) => logRtpStream("CONSUMER_TRACE", { consumerId: consumer.id, socketId, trace }));
+  consumer.on("trace", (trace) =>
+    logRtpStream("CONSUMER_TRACE", {
+      consumerId: consumer.id,
+      socketId,
+      type: trace.type,
+      kind: consumer.kind,
+    }),
+  );
 
-  // const statsInterval = setInterval(async () => {  }, 5000);
+  const statsInterval = setInterval(async () => {
+    if (consumer.closed) {
+      clearInterval(statsInterval);
+      return;
+    }
+    try {
+      const stats = await consumer.getStats();
+      logRtpStream("CONSUMER_STATS", {
+        consumerId: consumer.id,
+        socketId,
+        kind: consumer.kind,
+        stats,
+      });
+    } catch (error) {
+      /* console.error(`Error getting consumer ${consumer.id} stats:`, error); */
+    }
+  }, 15000);
+
   consumer.on("@close", () => {
-    // clearInterval(statsInterval);
-    logRtpStream("CONSUMER_CLOSED", { consumerId: consumer.id, socketId });
+    clearInterval(statsInterval);
+    logRtpStream("CONSUMER_INTERNAL_CLOSE", {
+      consumerId: consumer.id,
+      socketId,
+    });
   });
+  consumer.observer.on("close", () => {
+    logRtpStream("CONSUMER_OBSERVER_CLOSE", {
+      consumerId: consumer.id,
+      socketId,
+    });
+  });
+  consumer.observer.on("pause", () =>
+    logRtpStream("CONSUMER_OBSERVER_PAUSE", {
+      consumerId: consumer.id,
+      socketId,
+    }),
+  );
+  consumer.observer.on("resume", () =>
+    logRtpStream("CONSUMER_OBSERVER_RESUME", {
+      consumerId: consumer.id,
+      socketId,
+    }),
+  );
 };
 
 const setupTransportLogging = (
@@ -478,36 +721,97 @@ const setupTransportLogging = (
   prefix: string,
   socketId: string,
 ) => {
-  console.log(
-    `Setting up logging for ${prefix} ${transport.id} for ${socketId}`,
-  );
+  logRtpStream(`${prefix}_LOGGING_SETUP`, {
+    transportId: transport.id,
+    socketId,
+  });
   transport.on("dtlsstatechange", (dtlsState) => {
-    logRtpStream(`${prefix}_DTLS_STATE`, {
+    logRtpStream(`${prefix}_DTLS_STATE_CHANGE`, {
       transportId: transport.id,
       socketId,
       dtlsState,
     });
     if (dtlsState === "closed" || dtlsState === "failed") {
-      console.warn(
-        `${prefix} ${transport.id} DTLS state ${dtlsState}, transport will be closed.`,
-      );
+      logRtpStream(`${prefix}_DTLS_CLOSED_OR_FAILED`, {
+        transportId: transport.id,
+        socketId,
+        dtlsState,
+      });
       // transport.close();
     }
   });
   transport.on("icestatechange", (iceState) =>
-    logRtpStream(`${prefix}_ICE_STATE`, {
+    logRtpStream(`${prefix}_ICE_STATE_CHANGE`, {
       transportId: transport.id,
       socketId,
       iceState,
     }),
   );
-  // transport.on("iceselectedtuplechange", (tuple) => logRtpStream(`${prefix}_ICE_TUPLE`, { transportId: transport.id, socketId, tuple }));
-  // transport.on("sctpstatechange", (sctpState) => logRtpStream(`${prefix}_SCTP_STATE`, { transportId: transport.id, socketId, sctpState }));
-  // transport.on("trace", (trace) => logRtpStream(`${prefix}_TRACE`, { transportId: transport.id, socketId, trace }));
+  transport.on("iceselectedtuplechange", (tuple: TransportTuple) =>
+    logRtpStream(`${prefix}_ICE_SELECTED_TUPLE`, {
+      transportId: transport.id,
+      socketId,
+      tuple,
+    }),
+  );
+  transport.on("sctpstatechange", (sctpState: SctpState) =>
+    logRtpStream(`${prefix}_SCTP_STATE_CHANGE`, {
+      transportId: transport.id,
+      socketId,
+      sctpState,
+    }),
+  );
+  transport.on("trace", (trace) =>
+    logRtpStream(`${prefix}_TRACE`, {
+      transportId: transport.id,
+      socketId,
+      type: trace.type,
+      direction: trace.direction,
+    }),
+  );
 
-  // const statsInterval = setInterval(async () => {  }, 10000);
+  const statsInterval = setInterval(async () => {
+    if (transport.closed) {
+      clearInterval(statsInterval);
+      return;
+    }
+    try {
+      const stats = await transport.getStats();
+      logRtpStream(`${prefix}_STATS`, {
+        transportId: transport.id,
+        socketId,
+        stats,
+      });
+    } catch (error) {
+      /* console.error(`Error getting ${prefix} ${transport.id} stats:`, error); */
+    }
+  }, 30000);
+
   transport.on("@close", () => {
-    // clearInterval(statsInterval);
-    logRtpStream(`${prefix}_CLOSED`, { transportId: transport.id, socketId });
+    clearInterval(statsInterval);
+    logRtpStream(`${prefix}_INTERNAL_CLOSE`, {
+      transportId: transport.id,
+      socketId,
+    });
+  });
+  transport.observer.on("close", () => {
+    logRtpStream(`${prefix}_OBSERVER_CLOSE`, {
+      transportId: transport.id,
+      socketId,
+    });
+  });
+  transport.observer.on("newproducer", (producer) => {
+    logRtpStream(`${prefix}_OBSERVER_NEWPRODUCER`, {
+      transportId: transport.id,
+      socketId,
+      producerId: producer.id,
+    });
+  });
+  transport.observer.on("newconsumer", (consumer) => {
+    logRtpStream(`${prefix}_OBSERVER_NEWCONSUMER`, {
+      transportId: transport.id,
+      socketId,
+      consumerId: consumer.id,
+    });
   });
 };
