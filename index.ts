@@ -82,7 +82,7 @@ const mediaCodecs: RtpCodecCapability[] = [
 
 (async () => {
   worker = await createWorker({
-    logLevel: "warn",
+    logLevel: "debug",
     logTags: [
       "rtp",
       "srtp",
@@ -137,7 +137,7 @@ peers.on("connection", async (socket: Socket) => {
   const existingProducersInfo = [];
   for (const [peerId, state] of peerStates) {
     if (peerId === socket.id) continue;
-    for (const [kind, producer] of state.producers) {
+    for (const [_, producer] of state.producers) {
       if (!producer.closed) {
         existingProducersInfo.push({
           producerId: producer.id,
@@ -364,7 +364,7 @@ peers.on("connection", async (socket: Socket) => {
         const otherProducersInfo = [];
         for (const [peerId, peerState] of peerStates) {
           if (peerId === socket.id) continue;
-          for (const [existingKind, existingProducer] of peerState.producers) {
+          for (const [_, existingProducer] of peerState.producers) {
             if (!existingProducer.closed) {
               otherProducersInfo.push({
                 producerId: existingProducer.id,
