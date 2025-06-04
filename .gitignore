@@ -6,7 +6,6 @@ yarn-debug.log*
 yarn-error.log*
 lerna-debug.log*
 node_modules/
-pnpm-lock.yaml
 server/
 
 # Diagnostic reports (https://nodejs.org/api/report.html)
