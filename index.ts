@@ -19,7 +19,7 @@ import type {
   WebRtcTransport,
   Worker,
 } from "mediasoup/node/lib/types";
-import { access, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 
 const options = {
   key: readFileSync("./server/ssl/key.pem", "utf-8"),
@@ -64,21 +64,16 @@ const hlsHttpServer = createHttpServer(async (req, res) => {
 
   try {
     await access(filePath);
-
     if (filePath.endsWith(".m3u8")) {
       res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
     } else if (filePath.endsWith(".ts")) {
       res.setHeader("Content-Type", "video/mp2t");
     }
-
     const fileContent = await readFile(filePath);
     res.writeHead(200);
     res.end(fileContent);
-  } catch (err) {
-    if (
-      err instanceof Error &&
-      (err as NodeJS.ErrnoException).code === "ENOENT"
-    ) {
+  } catch (err: any) {
+    if (err.code === "ENOENT") {
       if (reqUrl === "/playlist.m3u8") {
         res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
         res.writeHead(200);
@@ -126,8 +121,10 @@ interface PeerState {
   webRtcConsumerTransports: Map<string, WebRtcTransport>;
   webRtcConsumers: Map<string, Consumer>;
   producers: Map<string, Producer>;
+  hlsConsumerIds: Set<string>;
 }
 const peerStates = new Map<string, PeerState>();
+const producerIdToPeerState = new Map<string, PeerState>();
 
 const mediaCodecs: RtpCodecCapability[] = [
   {
@@ -185,10 +182,6 @@ const logPrefix = "[MediasoupServer]";
     process.exit(1);
   });
   router = await worker.createRouter({ mediaCodecs });
-  console.log(
-    `${logPrefix} Worker and Router created. Router RTP Capabilities:`,
-    router.rtpCapabilities.codecs?.map((c) => c.mimeType),
-  );
 })();
 
 peersSocketIO.on("connection", async (socket: Socket) => {
@@ -199,6 +192,7 @@ peersSocketIO.on("connection", async (socket: Socket) => {
     webRtcConsumerTransports: new Map(),
     webRtcConsumers: new Map(),
     producers: new Map(),
+    hlsConsumerIds: new Set(),
   };
   peerStates.set(socket.id, newPeerState);
   socket.emit("connection-success", { socketId: socket.id });
@@ -206,7 +200,7 @@ peersSocketIO.on("connection", async (socket: Socket) => {
   const existingProducersInfo = [];
   for (const [peerId, state] of peerStates) {
     if (peerId === socket.id) continue;
-    for (const [_, producer] of state.producers) {
+    for (const producer of state.producers.values()) {
       if (!producer.closed) {
         existingProducersInfo.push({
           producerId: producer.id,
@@ -217,9 +211,6 @@ peersSocketIO.on("connection", async (socket: Socket) => {
     }
   }
   if (existingProducersInfo.length > 0) {
-    console.log(
-      `${logPrefix} Informing ${socket.id} about ${existingProducersInfo.length} existing WebRTC producers.`,
-    );
     socket.emit("existing-producers", { producers: existingProducersInfo });
   }
 
@@ -227,20 +218,18 @@ peersSocketIO.on("connection", async (socket: Socket) => {
     console.log(`${logPrefix} Client disconnected: ${socket.id}`);
     const state = peerStates.get(socket.id);
     if (state) {
-      for (const [_, producer] of state.producers) {
+      for (const producer of state.producers.values()) {
         if (!producer.closed) producer.close();
       }
-      const hlsConsumersToClose = Array.from(hlsRtpConsumers.values()).filter(
-        (c) => c.socketId === socket.id,
-      );
-      for (const rtpInfo of hlsConsumersToClose) {
-        await removeRtpConsumerForHls(rtpInfo.consumer.id);
+      const consumersToClean = [...state.hlsConsumerIds];
+      for (const consumerId of consumersToClean) {
+        await removeRtpConsumerForHls(consumerId);
       }
-      for (const [_, c] of state.webRtcConsumers) {
-        if (!c.closed) c.close();
+      for (const consumer of state.webRtcConsumers.values()) {
+        if (!consumer.closed) consumer.close();
       }
-      for (const [_, t] of state.webRtcConsumerTransports) {
-        if (!t.closed) t.close();
+      for (const transport of state.webRtcConsumerTransports.values()) {
+        if (!transport.closed) transport.close();
       }
       state.producerTransport?.close();
     }
@@ -283,7 +272,7 @@ peersSocketIO.on("connection", async (socket: Socket) => {
         });
       } catch (error) {
         console.error(
-          `${logPrefix} createWebRtcTransport error for ${socket.id} (sender: ${sender}):`,
+          `${logPrefix} createWebRtcTransport error for ${socket.id}:`,
           error,
         );
         callback({ error: (error as Error).message });
@@ -302,21 +291,16 @@ peersSocketIO.on("connection", async (socket: Socket) => {
     }) => {
       const state = peerStates.get(socket.id);
       if (!state) return;
-      let transport: Transport | undefined = state.producerTransport;
-      if (state.producerTransport?.id !== transportId) {
-        transport = state.webRtcConsumerTransports.get(transportId);
-      }
-      if (!transport) {
-        console.error(
-          `${logPrefix} transport-connect: transport ${transportId} not found for ${socket.id}`,
-        );
-        return;
-      }
+      const transport: Transport | undefined =
+        state.producerTransport?.id === transportId
+          ? state.producerTransport
+          : state.webRtcConsumerTransports.get(transportId);
+      if (!transport) return;
       try {
         await transport.connect({ dtlsParameters });
       } catch (error) {
         console.error(
-          `${logPrefix} transport-connect error for ${transportId} (peer ${socket.id}):`,
+          `${logPrefix} transport-connect error for ${transportId}:`,
           error,
         );
       }
@@ -348,9 +332,6 @@ peersSocketIO.on("connection", async (socket: Socket) => {
       }
       const existingProducer = state.producers.get(kind);
       if (existingProducer && !existingProducer.closed) {
-        console.warn(
-          `${logPrefix} Peer ${socket.id} replacing existing ${kind} producer: ${existingProducer.id}.`,
-        );
         existingProducer.close();
       }
 
@@ -366,24 +347,15 @@ peersSocketIO.on("connection", async (socket: Socket) => {
           },
         });
         state.producers.set(kind, producer);
-        console.log(
-          `${logPrefix} WebRTC Producer created: ${producer.id} (${kind}) by ${socket.id}. MimeType: ${producer.rtpParameters.codecs[0].mimeType}`,
-        );
+        producerIdToPeerState.set(producer.id, state);
 
         await setupProducerForHls(socket.id, producer);
 
-        producer.on("transportclose", async () => {
-          console.log(
-            `${logPrefix} WebRTC Producer ${producer.id} (for ${socket.id}) transport closed.`,
-          );
-        });
         producer.observer.on("close", async () => {
-          console.log(
-            `${logPrefix} WebRTC Producer ${producer.id} (for ${socket.id}) OBSERVER closed.`,
-          );
           if (state.producers.get(kind)?.id === producer.id) {
             state.producers.delete(kind);
           }
+          producerIdToPeerState.delete(producer.id);
           await removeRtpConsumersByProducerId(producer.id);
           socket.broadcast.emit("producer-closed", { producerId: producer.id });
         });
@@ -418,73 +390,38 @@ peersSocketIO.on("connection", async (socket: Socket) => {
       },
       callback,
     ) => {
-      console.log(
-        `${logPrefix} [WebRTC Consume Request] From: ${socket.id}, For Producer: ${producerId}, On Transport: ${consumerTransportId}`,
-      );
       const consumingPeerState = peerStates.get(socket.id);
       if (!consumingPeerState) {
-        console.error(
-          `${logPrefix} [WebRTC Consume Error] Peer state for ${socket.id} not found.`,
-        );
         return callback({ error: `Peer state for ${socket.id} not found` });
       }
-
       const transport =
         consumingPeerState.webRtcConsumerTransports.get(consumerTransportId);
-      if (!transport) {
-        console.error(
-          `${logPrefix} [WebRTC Consume Error] WebRTC consumer transport ${consumerTransportId} not found for ${socket.id}. Available:`,
-          Array.from(consumingPeerState.webRtcConsumerTransports.keys()),
-        );
+      if (!transport || transport.closed) {
         return callback({
-          error: `WebRTC consumer transport ${consumerTransportId} not found for ${socket.id}`,
-        });
-      }
-      if (transport.closed) {
-        console.error(
-          `${logPrefix} [WebRTC Consume Error] WebRTC consumer transport ${consumerTransportId} is closed for ${socket.id}.`,
-        );
-        return callback({
-          error: `WebRTC consumer transport ${consumerTransportId} is closed.`,
+          error: `WebRTC consumer transport ${consumerTransportId} not found or closed.`,
         });
       }
 
+      const producerPeerState = producerIdToPeerState.get(producerId);
       let targetProducer: Producer | undefined;
-      let producerPeerId: string | undefined;
-      for (const [peerId, otherPeerState] of peerStates) {
-        if (otherPeerState.socketId === socket.id) continue;
-        for (const [_, p] of otherPeerState.producers) {
+      if (producerPeerState) {
+        for (const p of producerPeerState.producers.values()) {
           if (p.id === producerId) {
             targetProducer = p;
-            producerPeerId = peerId;
             break;
           }
         }
-        if (targetProducer) break;
       }
 
       if (!targetProducer || targetProducer.closed) {
-        console.error(
-          `${logPrefix} [WebRTC Consume Error] Target producer ${producerId} not found or closed (requested by ${socket.id}).`,
-        );
         return callback({
           error: `Target producer ${producerId} not found or closed`,
         });
       }
-      console.log(
-        `${logPrefix} [WebRTC Consume Request] Target producer ${targetProducer.id} (kind: ${targetProducer.kind}) from peer ${producerPeerId} found for ${socket.id}.`,
-      );
-
       if (
         !router.canConsume({ producerId: targetProducer.id, rtpCapabilities })
       ) {
-        console.error(
-          `${logPrefix} [WebRTC Consume Error] Peer ${socket.id} cannot consume producer ${producerId}. Client caps:`,
-          rtpCapabilities.codecs?.map((c) => c.mimeType),
-        );
-        return callback({
-          error: `Cannot consume producer ${producerId} with provided capabilities`,
-        });
+        return callback({ error: `Cannot consume producer ${producerId}` });
       }
 
       try {
@@ -500,16 +437,10 @@ peersSocketIO.on("connection", async (socket: Socket) => {
         });
         consumingPeerState.webRtcConsumers.set(consumer.id, consumer);
 
-        consumer.on("transportclose", () => {
-          console.log(
-            `${logPrefix} WebRTC Consumer ${consumer.id} (for P:${targetProducer?.id}) transport closed.`,
-          );
-          consumingPeerState.webRtcConsumers.delete(consumer.id);
-        });
+        consumer.on("transportclose", () =>
+          consumingPeerState.webRtcConsumers.delete(consumer.id),
+        );
         consumer.on("producerclose", () => {
-          console.log(
-            `${logPrefix} WebRTC Consumer ${consumer.id} (for P:${targetProducer?.id}) its producer closed.`,
-          );
           socket.emit("consumer-closed", {
             consumerId: consumer.id,
             producerId: targetProducer?.id,
@@ -517,16 +448,10 @@ peersSocketIO.on("connection", async (socket: Socket) => {
           consumingPeerState.webRtcConsumers.delete(consumer.id);
           if (!consumer.closed) consumer.close();
         });
-        consumer.observer.on("close", () => {
-          console.log(
-            `${logPrefix} WebRTC Consumer ${consumer.id} observer closed.`,
-          );
-          consumingPeerState.webRtcConsumers.delete(consumer.id);
-        });
-
-        console.log(
-          `${logPrefix} [WebRTC Consume Success] Consumer ${consumer.id} created for ${socket.id} on P:${producerId}`,
+        consumer.observer.on("close", () =>
+          consumingPeerState.webRtcConsumers.delete(consumer.id),
         );
+
         callback({
           params: {
             id: consumer.id,
@@ -537,7 +462,7 @@ peersSocketIO.on("connection", async (socket: Socket) => {
         });
       } catch (error) {
         console.error(
-          `${logPrefix} WebRTC consume error for ${socket.id} on P:${producerId}:`,
+          `${logPrefix} WebRTC consume error for ${socket.id}:`,
           error,
         );
         callback({ error: (error as Error).message });
@@ -548,32 +473,18 @@ peersSocketIO.on("connection", async (socket: Socket) => {
   socket.on(
     "consumer-resume",
     async ({ consumerId }: { consumerId: string }) => {
-      console.log(
-        `${logPrefix} [WebRTC Resume Request] For consumer ${consumerId} by ${socket.id}`,
-      );
       const peerState = peerStates.get(socket.id);
       const consumer = peerState?.webRtcConsumers.get(consumerId);
-
       if (consumer && !consumer.closed) {
-        if (consumer.appData.hlsPipe) {
-          console.warn(
-            `${logPrefix} Attempt to resume HLS consumer ${consumerId} via WebRTC path. Ignoring.`,
-          );
-          return;
-        }
+        if (consumer.appData.hlsPipe) return;
         try {
           await consumer.resume();
-          console.log(`${logPrefix} WebRTC Consumer ${consumerId} resumed.`);
         } catch (error) {
           console.error(
             `${logPrefix} Error resuming WebRTC consumer ${consumerId}:`,
             error,
           );
         }
-      } else {
-        console.warn(
-          `${logPrefix} WebRTC consumer ${consumerId} not found or closed for resume request by ${socket.id}.`,
-        );
       }
     },
   );
@@ -592,14 +503,10 @@ function getNextRtpPorts(): {
 }
 
 async function setupProducerForHls(socketId: string, producer: Producer) {
-  console.log(
-    `${logPrefix} [HLS Pipe Setup] Producer ${producer.id} (${producer.kind}) from ${socketId}`,
-  );
-
   const { rtpPort, rtcpPort, rtcpMux } = getNextRtpPorts();
   const plainTransport = await router.createPlainTransport({
     listenIp: { ip: "0.0.0.0", announcedIp: "127.0.0.1" },
-    rtcpMux: rtcpMux,
+    rtcpMux,
     comedia: false,
     enableSctp: false,
     appData: {
@@ -611,36 +518,20 @@ async function setupProducerForHls(socketId: string, producer: Producer) {
   });
 
   try {
-    await plainTransport.connect({
-      ip: "127.0.0.1",
-      port: rtpPort,
-      rtcpPort: rtcpPort,
-    });
+    await plainTransport.connect({ ip: "127.0.0.1", port: rtpPort, rtcpPort });
   } catch (error) {
-    console.error(
-      `${logPrefix} [HLS Pipe Setup] PlainTransport connect error for P:${producer.id}:`,
-      error,
-    );
     plainTransport.close();
     return;
   }
-  console.log(
-    `${logPrefix} [HLS Pipe Setup] PlainTransport ${plainTransport.id} for P:${producer.id} connected to send to 127.0.0.1:${rtpPort}`,
-  );
 
   const producerCodecMimeType =
     producer.rtpParameters.codecs[0].mimeType.toLowerCase();
   const consumerCodecCap = router.rtpCapabilities.codecs?.find(
-    (codec) =>
-      codec.kind === producer.kind &&
-      codec.mimeType.toLowerCase() === producerCodecMimeType,
+    (c) =>
+      c.kind === producer.kind &&
+      c.mimeType.toLowerCase() === producerCodecMimeType,
   );
-
   if (!consumerCodecCap) {
-    console.error(
-      `${logPrefix} [HLS Pipe Setup] No compatible router codec for HLS. Producer kind: ${producer.kind}, MIME: ${producerCodecMimeType}. Router caps:`,
-      router.rtpCapabilities.codecs?.map((c) => c.mimeType),
-    );
     plainTransport.close();
     return;
   }
@@ -664,10 +555,6 @@ async function setupProducerForHls(socketId: string, producer: Producer) {
       },
     });
   } catch (error) {
-    console.error(
-      `${logPrefix} [HLS Pipe Setup] Error on plainTransport.consume() for P:${producer.id}:`,
-      error,
-    );
     plainTransport.close();
     return;
   }
@@ -681,48 +568,32 @@ async function setupProducerForHls(socketId: string, producer: Producer) {
     rtpParameters: consumer.rtpParameters,
     producerId: producer.id,
     kind: producer.kind,
-    socketId: socketId,
+    socketId,
   };
   hlsRtpConsumers.set(consumer.id, rtpConsumerInfo);
-  console.log(
-    `${logPrefix} [HLS Pipe Setup] HLS Consumer ${consumer.id} (P:${producer.id}) created. To 127.0.0.1:${rtpPort}. Codec: ${consumerCodecCap.mimeType}`,
-  );
+  peerStates.get(socketId)?.hlsConsumerIds.add(consumer.id);
 
-  consumer.on("transportclose", async () => {
-    console.log(
-      `${logPrefix} [HLS Pipe Event] Consumer ${consumer.id} (P:${producer.id}) transport closed.`,
-    );
+  const cleanup = async () => {
+    peerStates.get(socketId)?.hlsConsumerIds.delete(consumer.id);
     await removeRtpConsumerForHls(consumer.id);
-  });
-  consumer.on("producerclose", async () => {
-    console.log(
-      `${logPrefix} [HLS Pipe Event] Consumer ${consumer.id} (P:${producer.id}) producer closed.`,
-    );
-    await removeRtpConsumerForHls(consumer.id);
-  });
-  consumer.observer.on("close", async () => {
-    console.log(
-      `${logPrefix} [HLS Pipe Event] Consumer ${consumer.id} (P:${producer.id}) observer closed.`,
-    );
-    if (hlsRtpConsumers.has(consumer.id)) {
-      await removeRtpConsumerForHls(consumer.id);
-    }
-  });
+  };
+  consumer.on("transportclose", cleanup);
+  consumer.on("producerclose", cleanup);
+  consumer.observer.on("close", cleanup);
+
   await checkAndManageHlsFFmpeg();
 }
 
 async function removeRtpConsumerForHls(consumerId: string) {
   const rtpInfo = hlsRtpConsumers.get(consumerId);
   if (rtpInfo) {
-    console.log(
-      `${logPrefix} [HLS Pipe Cleanup] Removing HLS Consumer ${rtpInfo.consumer.id} (P:${rtpInfo.producerId}, ${rtpInfo.kind}).`,
-    );
     if (!rtpInfo.consumer.closed) rtpInfo.consumer.close();
     if (!rtpInfo.plainTransport.closed) rtpInfo.plainTransport.close();
     hlsRtpConsumers.delete(consumerId);
     await checkAndManageHlsFFmpeg();
   }
 }
+
 async function removeRtpConsumersByProducerId(producerId: string) {
   const consumersToClose = Array.from(hlsRtpConsumers.values()).filter(
     (c) => c.producerId === producerId,
@@ -738,9 +609,7 @@ function generateSdpForFFmpeg(ffmpegConsumers: RtpConsumerInfo[]): string {
   const sortedConsumers = [...ffmpegConsumers].sort((a, b) => {
     const socketIdCompare = a.socketId.localeCompare(b.socketId);
     if (socketIdCompare !== 0) return socketIdCompare;
-    if (a.kind === "video" && b.kind === "audio") return -1;
-    if (a.kind === "audio" && b.kind === "video") return 1;
-    return 0;
+    return a.kind === "video" ? -1 : 1;
   });
 
   for (const info of sortedConsumers) {
@@ -756,20 +625,18 @@ function generateSdpForFFmpeg(ffmpegConsumers: RtpConsumerInfo[]): string {
     if (info.rtpParameters.encodings?.[0]?.ssrc) {
       sdp += `a=ssrc:${info.rtpParameters.encodings[0].ssrc}\n`;
     }
-    if (info.remoteRtcpPort) sdp += `a=rtcp:${info.remoteRtcpPort}\n`;
-    else sdp += "a=rtcp-mux\n";
+    sdp += "a=rtcp-mux\n";
     sdp += "a=sendonly\n";
   }
   return sdp;
 }
 
 async function checkAndManageHlsFFmpeg() {
-  const activeHlsPipes = Array.from(hlsRtpConsumers.values());
   const participantsData = new Map<
     string,
     { video?: RtpConsumerInfo; audio?: RtpConsumerInfo }
   >();
-  for (const pipe of activeHlsPipes) {
+  for (const pipe of hlsRtpConsumers.values()) {
     const pData = participantsData.get(pipe.socketId) || {};
     if (pipe.kind === "video") pData.video = pipe;
     if (pipe.kind === "audio") pData.audio = pipe;
@@ -784,16 +651,9 @@ async function checkAndManageHlsFFmpeg() {
     completeParticipants.length === MAX_HLS_PARTICIPANTS &&
     !isHlsStreamingActive
   ) {
-    console.log(
-      `${logPrefix} [FFmpeg Control] ${MAX_HLS_PARTICIPANTS} complete participants. Starting HLS.`,
-    );
     const consumersForSdp: RtpConsumerInfo[] = [];
-    const sortedCompleteParticipants = [...completeParticipants].sort(
-      (a, b) => {
-        const aId = a.video?.socketId || a.audio?.socketId || "";
-        const bId = b.video?.socketId || b.audio?.socketId || "";
-        return aId.localeCompare(bId);
-      },
+    const sortedCompleteParticipants = [...completeParticipants].sort((a, b) =>
+      (a.video?.socketId || "").localeCompare(b.video?.socketId || ""),
     );
     for (const p of sortedCompleteParticipants) {
       if (p.video) consumersForSdp.push(p.video);
@@ -804,57 +664,27 @@ async function checkAndManageHlsFFmpeg() {
     completeParticipants.length < MAX_HLS_PARTICIPANTS &&
     isHlsStreamingActive
   ) {
-    console.log(
-      `${logPrefix} [FFmpeg Control] Participants for HLS < ${MAX_HLS_PARTICIPANTS}. Stopping HLS.`,
-    );
     await stopHlsFFmpeg();
-  } else if (isHlsStreamingActive)
-    console.log(
-      `${logPrefix} [FFmpeg Control] HLS active. ${completeParticipants.length} complete HLS participants.`,
-    );
-  else
-    console.log(
-      `${logPrefix} [FFmpeg Control] Not starting HLS. ${completeParticipants.length} complete HLS participants. Pipes: ${activeHlsPipes.length}`,
-    );
+  }
 }
 
 async function startHlsFFmpeg(ffmpegConsumers: RtpConsumerInfo[]) {
-  if (ffmpegProcess) {
-    console.log(`${logPrefix} [FFmpeg Start] FFmpeg already running.`);
-    return;
-  }
+  if (ffmpegProcess) return;
   const videoC = ffmpegConsumers.filter((c) => c.kind === "video").length;
   const audioC = ffmpegConsumers.filter((c) => c.kind === "audio").length;
-  if (videoC === 0 || audioC === 0) {
-    console.log(
-      `${logPrefix} [FFmpeg Start] Need >=1 video & >=1 audio. Got V:${videoC}, A:${audioC}.`,
+  if (videoC === 0 || audioC === 0) return;
+
+  try {
+    await rm(HLS_OUTPUT_DIR, { recursive: true, force: true });
+    await mkdir(HLS_OUTPUT_DIR, { recursive: true });
+    const sdpContent = generateSdpForFFmpeg(ffmpegConsumers);
+    await writeFile(SDP_FILE_PATH, sdpContent, "utf8");
+  } catch (err) {
+    console.error(
+      `${logPrefix} [FFmpeg Start] Error preparing HLS directory:`,
+      err,
     );
     return;
-  }
-
-  const sdpContent = generateSdpForFFmpeg(ffmpegConsumers);
-  try {
-    await writeFile(SDP_FILE_PATH, sdpContent, "utf8");
-    console.log(`${logPrefix} [FFmpeg Start] SDP file: ${SDP_FILE_PATH}`);
-  } catch (err) {
-    console.error(`${logPrefix} [FFmpeg Start] Error writing SDP:`, err);
-    return;
-  }
-
-  try {
-    const files = await readdir(HLS_OUTPUT_DIR);
-    const deletionPromises = files
-      .filter(
-        (f) =>
-          f.endsWith(".ts") ||
-          (f.endsWith(".m3u8") && f !== path.basename(SDP_FILE_PATH)),
-      )
-      .map((f) =>
-        rm(path.join(HLS_OUTPUT_DIR, f), { force: true, recursive: true }),
-      );
-    await Promise.all(deletionPromises);
-  } catch (err) {
-    console.error(`${logPrefix} [FFmpeg Start] Error cleaning HLS dir:`, err);
   }
 
   const findSdpIndex = (c?: RtpConsumerInfo) =>
@@ -868,8 +698,7 @@ async function startHlsFFmpeg(ffmpegConsumers: RtpConsumerInfo[]) {
   const p1a = ffmpegConsumers.find(
     (c) => c.kind === "audio" && c.socketId === uniqueSocketIds[0],
   );
-  let p2v: RtpConsumerInfo | undefined;
-  let p2a: RtpConsumerInfo | undefined;
+  let p2v: RtpConsumerInfo | undefined, p2a: RtpConsumerInfo | undefined;
   if (uniqueSocketIds.length > 1) {
     p2v = ffmpegConsumers.find(
       (c) => c.kind === "video" && c.socketId === uniqueSocketIds[1],
@@ -878,30 +707,33 @@ async function startHlsFFmpeg(ffmpegConsumers: RtpConsumerInfo[]) {
       (c) => c.kind === "audio" && c.socketId === uniqueSocketIds[1],
     );
   }
-  const p1vSdpIdx = findSdpIndex(p1v);
-  const p1aSdpIdx = findSdpIndex(p1a);
-  const p2vSdpIdx = findSdpIndex(p2v);
-  const p2aSdpIdx = findSdpIndex(p2a);
-  console.log(
-    `${logPrefix} [FFmpeg Start] SDP Indices - P1V:${p1vSdpIdx}, P1A:${p1aSdpIdx}, P2V:${p2vSdpIdx}, P2A:${p2aSdpIdx}`,
-  );
+  const [p1vSdpIdx, p1aSdpIdx, p2vSdpIdx, p2aSdpIdx] = [
+    findSdpIndex(p1v),
+    findSdpIndex(p1a),
+    findSdpIndex(p2v),
+    findSdpIndex(p2a),
+  ];
 
   let filterComplex = "";
   const outputMaps: string[] = [];
-  if (p1vSdpIdx !== -1)
-    filterComplex += `[0:${p1vSdpIdx}]setpts=PTS-STARTPTS,scale=640:360,fps=25[left];`;
-  else filterComplex += "nullsrc=size=640:360:rate=25[left];";
-  if (p2vSdpIdx !== -1)
-    filterComplex += `[0:${p2vSdpIdx}]setpts=PTS-STARTPTS,scale=640:360,fps=25[right];`;
-  else filterComplex += "nullsrc=size=640:360:rate=25[right];";
+  filterComplex +=
+    p1vSdpIdx !== -1
+      ? `[0:${p1vSdpIdx}]setpts=PTS-STARTPTS,scale=640:360,fps=25[left];`
+      : "nullsrc=size=640:360:rate=25[left];";
+  filterComplex +=
+    p2vSdpIdx !== -1
+      ? `[0:${p2vSdpIdx}]setpts=PTS-STARTPTS,scale=640:360,fps=25[right];`
+      : "nullsrc=size=640:360:rate=25[right];";
   filterComplex += "[left][right]hstack=inputs=2[v];";
   outputMaps.push("-map", "[v]");
-  if (p1aSdpIdx !== -1)
-    filterComplex += `[0:${p1aSdpIdx}]asetpts=PTS-STARTPTS,volume=0.8[a1];`;
-  else filterComplex += "anullsrc=channel_layout=stereo:sample_rate=48000[a1];";
-  if (p2aSdpIdx !== -1)
-    filterComplex += `[0:${p2aSdpIdx}]asetpts=PTS-STARTPTS,volume=0.8[a2];`;
-  else filterComplex += "anullsrc=channel_layout=stereo:sample_rate=48000[a2];";
+  filterComplex +=
+    p1aSdpIdx !== -1
+      ? `[0:${p1aSdpIdx}]asetpts=PTS-STARTPTS,volume=0.8[a1];`
+      : "anullsrc=channel_layout=stereo:sample_rate=48000[a1];";
+  filterComplex +=
+    p2aSdpIdx !== -1
+      ? `[0:${p2aSdpIdx}]asetpts=PTS-STARTPTS,volume=0.8[a2];`
+      : "anullsrc=channel_layout=stereo:sample_rate=48000[a2];";
   filterComplex +=
     "[a1][a2]amix=inputs=2:duration=longest:dropout_transition=2:normalize=0[a];";
   outputMaps.push("-map", "[a]");
@@ -976,9 +808,6 @@ async function startHlsFFmpeg(ffmpegConsumers: RtpConsumerInfo[]) {
     path.join(HLS_OUTPUT_DIR, "segment_%05d.ts"),
     path.join(HLS_OUTPUT_DIR, "playlist.m3u8"),
   ];
-  console.log(
-    `${logPrefix} [FFmpeg Start] Spawning: ffmpeg ${ffmpegArgs.map((arg) => (arg.includes(" ") ? `"${arg}"` : arg)).join(" ")}`,
-  );
 
   ffmpegProcess = spawn("ffmpeg", ffmpegArgs, { detached: false });
   isHlsStreamingActive = true;
@@ -989,34 +818,21 @@ async function startHlsFFmpeg(ffmpegConsumers: RtpConsumerInfo[]) {
   ffmpegProcess.stderr?.on("data", (data) =>
     console.error(`${logPrefix} [FFmpeg ERR] ${data.toString().trim()}`),
   );
-  ffmpegProcess.on("close", (code, signal) => {
-    console.log(
-      `${logPrefix} [FFmpeg End] FFmpeg exited with code ${code}, signal ${signal}`,
-    );
+  ffmpegProcess.on("close", () => {
     isHlsStreamingActive = false;
     ffmpegProcess = null;
   });
-  ffmpegProcess.on("error", (err) => {
-    console.error(`${logPrefix} [FFmpeg Error] Spawning FFmpeg:`, err);
+  ffmpegProcess.on("error", () => {
     isHlsStreamingActive = false;
     ffmpegProcess = null;
   });
 
   setTimeout(async () => {
-    if (!isHlsStreamingActive || !ffmpegProcess) {
-      console.log(
-        `${logPrefix} [FFmpeg Resume] FFmpeg not active, not resuming.`,
-      );
-      return;
-    }
-    console.log(`${logPrefix} [FFmpeg Resume] Resuming consumers...`);
+    if (!isHlsStreamingActive || !ffmpegProcess) return;
     for (const rtpInfo of ffmpegConsumers) {
       if (rtpInfo.consumer && !rtpInfo.consumer.closed) {
         try {
           await rtpInfo.consumer.resume();
-          console.log(
-            `${logPrefix} [FFmpeg Resume] Resumed ${rtpInfo.consumer.id} (${rtpInfo.kind})`,
-          );
           if (rtpInfo.kind === "video")
             await rtpInfo.consumer.requestKeyFrame();
         } catch (e) {
@@ -1032,41 +848,28 @@ async function startHlsFFmpeg(ffmpegConsumers: RtpConsumerInfo[]) {
 
 async function stopHlsFFmpeg() {
   if (ffmpegProcess) {
-    console.log(
-      `${logPrefix} [FFmpeg Stop] Stopping FFmpeg (PID: ${ffmpegProcess.pid})...`,
-    );
     ffmpegProcess.kill("SIGINT");
   }
 }
 
 process.on("SIGINT", async () => {
-  console.log(`\n${logPrefix} SIGINT. Shutting down...`);
   await stopHlsFFmpeg();
-  const cleanupPromises = [];
-  for (const [_, info] of hlsRtpConsumers) {
-    cleanupPromises.push(removeRtpConsumerForHls(info.consumer.id));
-  }
+  const cleanupPromises = Array.from(hlsRtpConsumers.keys()).map(
+    removeRtpConsumerForHls,
+  );
   await Promise.all(cleanupPromises);
-  for (const [_, s] of peerStates) {
-    for (const [_, p] of s.producers) {
+  for (const s of peerStates.values()) {
+    s.producers.forEach((p) => {
       if (!p.closed) p.close();
-    }
+    });
     s.producerTransport?.close();
-    for (const [_, t] of s.webRtcConsumerTransports) {
+    s.webRtcConsumerTransports.forEach((t) => {
       if (!t.closed) t.close();
-    }
+    });
   }
   peerStates.clear();
   if (router && !router.closed) router.close();
-  hlsHttpServer.close(() =>
-    console.log(`${logPrefix} HLS HTTP server closed.`),
-  );
-  httpsServer.close(() => {
-    console.log(`${logPrefix} HTTPS signaling server closed.`);
-    process.exit(0);
-  });
-  setTimeout(() => {
-    console.error(`${logPrefix} Timeout shutdown. Forcing exit.`);
-    process.exit(1);
-  }, 7000);
+  hlsHttpServer.close();
+  httpsServer.close(() => process.exit(0));
+  setTimeout(() => process.exit(1), 7000);
 });
