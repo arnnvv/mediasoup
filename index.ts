@@ -199,7 +199,7 @@ const sendResponse = (ws: WebSocket, requestId: string, data: object) => {
 };
 
 const broadcast = (senderId: string, event: string, data: object) => {
-  wss.clients.forEach((client) => {
+  for (const client of wss.clients) {
     const customClient = client as CustomWebSocket;
     if (
       customClient.readyState === WebSocket.OPEN &&
@@ -207,7 +207,7 @@ const broadcast = (senderId: string, event: string, data: object) => {
     ) {
       sendMessage(customClient, event, data);
     }
-  });
+  }
 };
 
 wss.on("connection", async (ws: CustomWebSocket) => {
