@@ -1041,7 +1041,7 @@ async function stopHlsFFmpeg() {
 process.on("SIGINT", async () => {
   console.log(`\n${logPrefix} SIGINT. Shutting down...`);
   await stopHlsFFmpeg();
-  const cleanupPromises: Promise<any>[] = [];
+  const cleanupPromises = [];
   for (const [_, info] of hlsRtpConsumers) {
     cleanupPromises.push(removeRtpConsumerForHls(info.consumer.id));
   }
