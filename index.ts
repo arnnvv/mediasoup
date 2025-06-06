@@ -1,13 +1,6 @@
 import { createServer as createHttpsServer } from "node:https";
 import { createServer as createHttpServer } from "node:http";
-import {
-  readFileSync,
-  existsSync,
-  mkdirSync,
-  readdirSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
+import { readFileSync, existsSync as fsExistsSync, mkdirSync } from "node:fs";
 import { Server as SocketIOServer, type Socket } from "socket.io";
 import { createWorker } from "mediasoup";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -26,6 +19,7 @@ import type {
   WebRtcTransport,
   Worker,
 } from "mediasoup/node/lib/types";
+import { access, readdir, readFile, rm, writeFile } from "node:fs/promises";
 
 const options = {
   key: readFileSync("./server/ssl/key.pem", "utf-8"),
@@ -45,11 +39,11 @@ const HLS_OUTPUT_DIR = path.join(__dirname, "hls_output_composite_rtp");
 const HLS_PORT = 8080;
 const SDP_FILE_PATH = path.join(HLS_OUTPUT_DIR, "composite_stream.sdp");
 
-if (!existsSync(HLS_OUTPUT_DIR)) {
+if (!fsExistsSync(HLS_OUTPUT_DIR)) {
   mkdirSync(HLS_OUTPUT_DIR, { recursive: true });
 }
 
-const hlsHttpServer = createHttpServer((req, res) => {
+const hlsHttpServer = createHttpServer(async (req, res) => {
   const reqUrl = req.url === "/" ? "/playlist.m3u8" : req.url;
   const filePath = path.join(HLS_OUTPUT_DIR, reqUrl!);
   if (filePath.indexOf(HLS_OUTPUT_DIR) !== 0) {
@@ -68,34 +62,38 @@ const hlsHttpServer = createHttpServer((req, res) => {
     return;
   }
 
-  if (!existsSync(filePath)) {
-    if (reqUrl === "/playlist.m3u8") {
-      res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
-      res.writeHead(200);
-      res.end(
-        "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:2.000000,\n/dev/null\n#EXT-X-ENDLIST\n",
-      );
-    } else {
-      res.writeHead(404);
-      res.end("Not Found");
-    }
-    return;
-  }
-
-  if (filePath.endsWith(".m3u8")) {
-    res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
-  } else if (filePath.endsWith(".ts")) {
-    res.setHeader("Content-Type", "video/mp2t");
-  }
-
   try {
-    const fileContent = readFileSync(filePath);
+    await access(filePath);
+
+    if (filePath.endsWith(".m3u8")) {
+      res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+    } else if (filePath.endsWith(".ts")) {
+      res.setHeader("Content-Type", "video/mp2t");
+    }
+
+    const fileContent = await readFile(filePath);
     res.writeHead(200);
     res.end(fileContent);
   } catch (err) {
-    console.error(`[HLS HTTP] Error reading file ${filePath}:`, err);
-    res.writeHead(500);
-    res.end("Server Error");
+    if (
+      err instanceof Error &&
+      (err as NodeJS.ErrnoException).code === "ENOENT"
+    ) {
+      if (reqUrl === "/playlist.m3u8") {
+        res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+        res.writeHead(200);
+        res.end(
+          "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:2.000000,\n/dev/null\n#EXT-X-ENDLIST\n",
+        );
+      } else {
+        res.writeHead(404);
+        res.end("Not Found");
+      }
+    } else {
+      console.error(`[HLS HTTP] Error reading file ${filePath}:`, err);
+      res.writeHead(500);
+      res.end("Server Error");
+    }
   }
 });
 
@@ -836,7 +834,7 @@ async function startHlsFFmpeg(ffmpegConsumers: RtpConsumerInfo[]) {
 
   const sdpContent = generateSdpForFFmpeg(ffmpegConsumers);
   try {
-    writeFileSync(SDP_FILE_PATH, sdpContent, "utf8");
+    await writeFile(SDP_FILE_PATH, sdpContent, "utf8");
     console.log(`${logPrefix} [FFmpeg Start] SDP file: ${SDP_FILE_PATH}`);
   } catch (err) {
     console.error(`${logPrefix} [FFmpeg Start] Error writing SDP:`, err);
@@ -844,16 +842,19 @@ async function startHlsFFmpeg(ffmpegConsumers: RtpConsumerInfo[]) {
   }
 
   try {
-    for (const f of readdirSync(HLS_OUTPUT_DIR)) {
-      if (
-        f.endsWith(".ts") ||
-        (f.endsWith(".m3u8") && f !== path.basename(SDP_FILE_PATH))
-      ) {
-        rmSync(path.join(HLS_OUTPUT_DIR, f), { force: true, recursive: true });
-      }
-    }
+    const files = await readdir(HLS_OUTPUT_DIR);
+    const deletionPromises = files
+      .filter(
+        (f) =>
+          f.endsWith(".ts") ||
+          (f.endsWith(".m3u8") && f !== path.basename(SDP_FILE_PATH)),
+      )
+      .map((f) =>
+        rm(path.join(HLS_OUTPUT_DIR, f), { force: true, recursive: true }),
+      );
+    await Promise.all(deletionPromises);
   } catch (err) {
-    console.error(err);
+    console.error(`${logPrefix} [FFmpeg Start] Error cleaning HLS dir:`, err);
   }
 
   const findSdpIndex = (c?: RtpConsumerInfo) =>
