@@ -1,18 +1,14 @@
 import { createServer as createHttpsServer } from "node:https";
 import { createServer as createHttpServer } from "node:http";
 import { readFileSync, existsSync as fsExistsSync, mkdirSync } from "node:fs";
-import { Server as SocketIOServer, type Socket } from "socket.io";
 import { createWorker } from "mediasoup";
 import { spawn, type ChildProcess } from "node:child_process";
 import path from "node:path";
 import type {
-  AppData,
   Consumer,
-  DtlsParameters,
   PlainTransport,
   Producer,
   Router,
-  RtpCapabilities,
   RtpCodecCapability,
   RtpParameters,
   Transport,
@@ -20,6 +16,8 @@ import type {
   Worker,
 } from "mediasoup/node/lib/types";
 import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { WebSocketServer, WebSocket } from "ws";
+import { randomUUID } from "node:crypto";
 
 const options = {
   key: readFileSync("./server/ssl/key.pem", "utf-8"),
@@ -30,10 +28,7 @@ httpsServer.listen(3000, () => {
   console.log("HTTPS signaling server listening on port: 3000");
 });
 
-const io = new SocketIOServer(httpsServer, {
-  cors: { origin: "*", methods: ["GET", "POST"] },
-});
-const peersSocketIO = io.of("/mediasoup");
+const wss = new WebSocketServer({ server: httpsServer, path: "/mediasoup" });
 
 const HLS_OUTPUT_DIR = path.join(__dirname, "hls_output_composite_rtp");
 const HLS_PORT = 8080;
@@ -187,22 +182,52 @@ const logPrefix = "[MediasoupServer]";
   router = await worker.createRouter({ mediaCodecs });
 })();
 
-peersSocketIO.on("connection", async (socket: Socket) => {
-  console.log(`${logPrefix} Client connected: ${socket.id}`);
+interface CustomWebSocket extends WebSocket {
+  id: string;
+}
+
+const sendMessage = (ws: WebSocket, event: string, data: object) => {
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ event, data }));
+  }
+};
+
+const sendResponse = (ws: WebSocket, requestId: string, data: object) => {
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ requestId, data }));
+  }
+};
+
+const broadcast = (senderId: string, event: string, data: object) => {
+  wss.clients.forEach((client) => {
+    const customClient = client as CustomWebSocket;
+    if (
+      customClient.readyState === WebSocket.OPEN &&
+      customClient.id !== senderId
+    ) {
+      sendMessage(customClient, event, data);
+    }
+  });
+};
+
+wss.on("connection", async (ws: CustomWebSocket) => {
+  ws.id = randomUUID();
+  console.log(`${logPrefix} Client connected: ${ws.id}`);
+
   const newPeerState: PeerState = {
-    socketId: socket.id,
+    socketId: ws.id,
     producerTransport: undefined,
     webRtcConsumerTransports: new Map(),
     webRtcConsumers: new Map(),
     producers: new Map(),
     hlsConsumerIds: new Set(),
   };
-  peerStates.set(socket.id, newPeerState);
-  socket.emit("connection-success", { socketId: socket.id });
+  peerStates.set(ws.id, newPeerState);
+  sendMessage(ws, "connection-success", { socketId: ws.id });
 
   const existingProducersInfo = [];
   for (const [peerId, state] of peerStates) {
-    if (peerId === socket.id) continue;
+    if (peerId === ws.id) continue;
     for (const producer of state.producers.values()) {
       if (!producer.closed) {
         existingProducersInfo.push({
@@ -214,12 +239,14 @@ peersSocketIO.on("connection", async (socket: Socket) => {
     }
   }
   if (existingProducersInfo.length > 0) {
-    socket.emit("existing-producers", { producers: existingProducersInfo });
+    sendMessage(ws, "existing-producers", {
+      producers: existingProducersInfo,
+    });
   }
 
-  socket.on("disconnect", async () => {
-    console.log(`${logPrefix} Client disconnected: ${socket.id}`);
-    const state = peerStates.get(socket.id);
+  ws.on("close", async () => {
+    console.log(`${logPrefix} Client disconnected: ${ws.id}`);
+    const state = peerStates.get(ws.id);
     if (state) {
       for (const producer of state.producers.values()) {
         if (!producer.closed) producer.close();
@@ -236,261 +263,254 @@ peersSocketIO.on("connection", async (socket: Socket) => {
       }
       state.producerTransport?.close();
     }
-    peerStates.delete(socket.id);
+    peerStates.delete(ws.id);
   });
 
-  socket.on("getRtpCapabilities", (callback) => {
-    callback({ rtpCapabilities: router.rtpCapabilities });
+  ws.on("message", async (message) => {
+    const { event, data, requestId } = JSON.parse(message.toString());
+
+    switch (event) {
+      case "getRtpCapabilities":
+        sendResponse(ws, requestId, {
+          rtpCapabilities: router.rtpCapabilities,
+        });
+        break;
+
+      case "createWebRtcTransport":
+        {
+          const { sender } = data;
+          const state = peerStates.get(ws.id);
+          if (!state)
+            return sendResponse(ws, requestId, {
+              error: "Peer state not found",
+            });
+          try {
+            const transport = await router.createWebRtcTransport({
+              listenIps: [{ ip: "0.0.0.0", announcedIp: "127.0.0.1" }],
+              enableUdp: true,
+              enableTcp: true,
+              preferUdp: true,
+              initialAvailableOutgoingBitrate: sender ? 1000000 : undefined,
+              appData: {
+                peerId: ws.id,
+                transportType: sender ? "producer" : "webrtc-consumer",
+              },
+            });
+            if (sender) {
+              state.producerTransport = transport;
+            } else {
+              state.webRtcConsumerTransports.set(transport.id, transport);
+            }
+            sendResponse(ws, requestId, {
+              params: {
+                id: transport.id,
+                iceParameters: transport.iceParameters,
+                iceCandidates: transport.iceCandidates,
+                dtlsParameters: transport.dtlsParameters,
+              },
+            });
+          } catch (error) {
+            console.error(
+              `${logPrefix} createWebRtcTransport error for ${ws.id}:`,
+              error,
+            );
+            sendResponse(ws, requestId, { error: (error as Error).message });
+          }
+        }
+        break;
+
+      case "transport-connect":
+        {
+          const { transportId, dtlsParameters } = data;
+          const state = peerStates.get(ws.id);
+          if (!state) return;
+          const transport: Transport | undefined =
+            state.producerTransport?.id === transportId
+              ? state.producerTransport
+              : state.webRtcConsumerTransports.get(transportId);
+          if (!transport) return;
+          try {
+            await transport.connect({ dtlsParameters });
+          } catch (error) {
+            console.error(
+              `${logPrefix} transport-connect error for ${transportId}:`,
+              error,
+            );
+          }
+        }
+        break;
+
+      case "transport-produce":
+        {
+          const { transportId, kind, rtpParameters, appData } = data;
+          const state = peerStates.get(ws.id);
+          if (
+            !state?.producerTransport ||
+            state.producerTransport.id !== transportId
+          ) {
+            return sendResponse(ws, requestId, {
+              error: "Producer transport error or mismatch",
+            });
+          }
+          const existingProducer = state.producers.get(kind);
+          if (existingProducer && !existingProducer.closed) {
+            existingProducer.close();
+          }
+          try {
+            const producer = await state.producerTransport.produce({
+              kind,
+              rtpParameters,
+              appData: {
+                ...appData,
+                peerId: ws.id,
+                kind,
+                for: "webrtcP2P_and_HLS",
+              },
+            });
+            state.producers.set(kind, producer);
+            producerIdToPeerState.set(producer.id, state);
+
+            await setupProducerForHls(ws.id, producer);
+
+            producer.observer.on("close", async () => {
+              if (state.producers.get(kind)?.id === producer.id) {
+                state.producers.delete(kind);
+              }
+              producerIdToPeerState.delete(producer.id);
+              await removeRtpConsumersByProducerId(producer.id);
+              broadcast(ws.id, "producer-closed", {
+                producerId: producer.id,
+              });
+            });
+
+            sendResponse(ws, requestId, { id: producer.id });
+            broadcast(ws.id, "new-producer", {
+              producerId: producer.id,
+              producerSocketId: ws.id,
+              kind: producer.kind,
+            });
+          } catch (error) {
+            console.error(
+              `${logPrefix} transport-produce error for ${ws.id}:`,
+              error,
+            );
+            sendResponse(ws, requestId, { error: (error as Error).message });
+          }
+        }
+        break;
+
+      case "consume":
+        {
+          const { consumerTransportId, producerId, rtpCapabilities } = data;
+          const consumingPeerState = peerStates.get(ws.id);
+          if (!consumingPeerState) {
+            return sendResponse(ws, requestId, {
+              error: `Peer state for ${ws.id} not found`,
+            });
+          }
+          const transport =
+            consumingPeerState.webRtcConsumerTransports.get(
+              consumerTransportId,
+            );
+          if (!transport || transport.closed) {
+            return sendResponse(ws, requestId, {
+              error: `WebRTC consumer transport ${consumerTransportId} not found or closed.`,
+            });
+          }
+
+          const producerPeerState = producerIdToPeerState.get(producerId);
+          let targetProducer: Producer | undefined;
+          if (producerPeerState) {
+            for (const p of producerPeerState.producers.values()) {
+              if (p.id === producerId) {
+                targetProducer = p;
+                break;
+              }
+            }
+          }
+
+          if (!targetProducer || targetProducer.closed) {
+            return sendResponse(ws, requestId, {
+              error: `Target producer ${producerId} not found or closed`,
+            });
+          }
+          if (
+            !router.canConsume({
+              producerId: targetProducer.id,
+              rtpCapabilities,
+            })
+          ) {
+            return sendResponse(ws, requestId, {
+              error: `Cannot consume producer ${producerId}`,
+            });
+          }
+
+          try {
+            const consumer = await transport.consume({
+              producerId: targetProducer.id,
+              rtpCapabilities,
+              paused: true,
+              appData: {
+                peerId: ws.id,
+                kind: targetProducer.kind,
+                consuming: "webrtc",
+              },
+            });
+            consumingPeerState.webRtcConsumers.set(consumer.id, consumer);
+
+            consumer.on("transportclose", () =>
+              consumingPeerState.webRtcConsumers.delete(consumer.id),
+            );
+            consumer.on("producerclose", () => {
+              sendMessage(ws, "consumer-closed", {
+                consumerId: consumer.id,
+                producerId: targetProducer?.id,
+              });
+              consumingPeerState.webRtcConsumers.delete(consumer.id);
+              if (!consumer.closed) consumer.close();
+            });
+            consumer.observer.on("close", () =>
+              consumingPeerState.webRtcConsumers.delete(consumer.id),
+            );
+
+            sendResponse(ws, requestId, {
+              params: {
+                id: consumer.id,
+                producerId,
+                kind: consumer.kind,
+                rtpParameters: consumer.rtpParameters,
+              },
+            });
+          } catch (error) {
+            console.error(
+              `${logPrefix} WebRTC consume error for ${ws.id}:`,
+              error,
+            );
+            sendResponse(ws, requestId, { error: (error as Error).message });
+          }
+        }
+        break;
+
+      case "consumer-resume":
+        {
+          const { consumerId } = data;
+          const peerState = peerStates.get(ws.id);
+          const consumer = peerState?.webRtcConsumers.get(consumerId);
+          if (consumer && !consumer.closed) {
+            if (consumer.appData.hlsPipe) return;
+            try {
+              await consumer.resume();
+            } catch (error) {
+              console.error(
+                `${logPrefix} Error resuming WebRTC consumer ${consumerId}:`,
+                error,
+              );
+            }
+          }
+        }
+        break;
+    }
   });
-
-  socket.on(
-    "createWebRtcTransport",
-    async ({ sender }: { sender: boolean }, callback) => {
-      const state = peerStates.get(socket.id);
-      if (!state) return callback({ error: "Peer state not found" });
-      try {
-        const transport = await router.createWebRtcTransport({
-          listenIps: [{ ip: "0.0.0.0", announcedIp: "127.0.0.1" }],
-          enableUdp: true,
-          enableTcp: true,
-          preferUdp: true,
-          initialAvailableOutgoingBitrate: sender ? 1000000 : undefined,
-          appData: {
-            peerId: socket.id,
-            transportType: sender ? "producer" : "webrtc-consumer",
-          },
-        });
-        if (sender) {
-          state.producerTransport = transport;
-        } else {
-          state.webRtcConsumerTransports.set(transport.id, transport);
-        }
-        callback({
-          params: {
-            id: transport.id,
-            iceParameters: transport.iceParameters,
-            iceCandidates: transport.iceCandidates,
-            dtlsParameters: transport.dtlsParameters,
-          },
-        });
-      } catch (error) {
-        console.error(
-          `${logPrefix} createWebRtcTransport error for ${socket.id}:`,
-          error,
-        );
-        callback({ error: (error as Error).message });
-      }
-    },
-  );
-
-  socket.on(
-    "transport-connect",
-    async ({
-      transportId,
-      dtlsParameters,
-    }: {
-      transportId: string;
-      dtlsParameters: DtlsParameters;
-    }) => {
-      const state = peerStates.get(socket.id);
-      if (!state) return;
-      const transport: Transport | undefined =
-        state.producerTransport?.id === transportId
-          ? state.producerTransport
-          : state.webRtcConsumerTransports.get(transportId);
-      if (!transport) return;
-      try {
-        await transport.connect({ dtlsParameters });
-      } catch (error) {
-        console.error(
-          `${logPrefix} transport-connect error for ${transportId}:`,
-          error,
-        );
-      }
-    },
-  );
-
-  socket.on(
-    "transport-produce",
-    async (
-      {
-        transportId,
-        kind,
-        rtpParameters,
-        appData,
-      }: {
-        transportId: string;
-        kind: "audio" | "video";
-        rtpParameters: RtpParameters;
-        appData?: AppData;
-      },
-      callback,
-    ) => {
-      const state = peerStates.get(socket.id);
-      if (
-        !state?.producerTransport ||
-        state.producerTransport.id !== transportId
-      ) {
-        return callback({ error: "Producer transport error or mismatch" });
-      }
-      const existingProducer = state.producers.get(kind);
-      if (existingProducer && !existingProducer.closed) {
-        existingProducer.close();
-      }
-
-      try {
-        const producer = await state.producerTransport.produce({
-          kind,
-          rtpParameters,
-          appData: {
-            ...appData,
-            peerId: socket.id,
-            kind,
-            for: "webrtcP2P_and_HLS",
-          },
-        });
-        state.producers.set(kind, producer);
-        producerIdToPeerState.set(producer.id, state);
-
-        await setupProducerForHls(socket.id, producer);
-
-        producer.observer.on("close", async () => {
-          if (state.producers.get(kind)?.id === producer.id) {
-            state.producers.delete(kind);
-          }
-          producerIdToPeerState.delete(producer.id);
-          await removeRtpConsumersByProducerId(producer.id);
-          socket.broadcast.emit("producer-closed", { producerId: producer.id });
-        });
-
-        callback({ id: producer.id });
-        socket.broadcast.emit("new-producer", {
-          producerId: producer.id,
-          producerSocketId: socket.id,
-          kind: producer.kind,
-        });
-      } catch (error) {
-        console.error(
-          `${logPrefix} transport-produce error for ${socket.id}:`,
-          error,
-        );
-        callback({ error: (error as Error).message });
-      }
-    },
-  );
-
-  socket.on(
-    "consume",
-    async (
-      {
-        consumerTransportId,
-        producerId,
-        rtpCapabilities,
-      }: {
-        consumerTransportId: string;
-        producerId: string;
-        rtpCapabilities: RtpCapabilities;
-      },
-      callback,
-    ) => {
-      const consumingPeerState = peerStates.get(socket.id);
-      if (!consumingPeerState) {
-        return callback({ error: `Peer state for ${socket.id} not found` });
-      }
-      const transport =
-        consumingPeerState.webRtcConsumerTransports.get(consumerTransportId);
-      if (!transport || transport.closed) {
-        return callback({
-          error: `WebRTC consumer transport ${consumerTransportId} not found or closed.`,
-        });
-      }
-
-      const producerPeerState = producerIdToPeerState.get(producerId);
-      let targetProducer: Producer | undefined;
-      if (producerPeerState) {
-        for (const p of producerPeerState.producers.values()) {
-          if (p.id === producerId) {
-            targetProducer = p;
-            break;
-          }
-        }
-      }
-
-      if (!targetProducer || targetProducer.closed) {
-        return callback({
-          error: `Target producer ${producerId} not found or closed`,
-        });
-      }
-      if (
-        !router.canConsume({ producerId: targetProducer.id, rtpCapabilities })
-      ) {
-        return callback({ error: `Cannot consume producer ${producerId}` });
-      }
-
-      try {
-        const consumer = await transport.consume({
-          producerId: targetProducer.id,
-          rtpCapabilities,
-          paused: true,
-          appData: {
-            peerId: socket.id,
-            kind: targetProducer.kind,
-            consuming: "webrtc",
-          },
-        });
-        consumingPeerState.webRtcConsumers.set(consumer.id, consumer);
-
-        consumer.on("transportclose", () =>
-          consumingPeerState.webRtcConsumers.delete(consumer.id),
-        );
-        consumer.on("producerclose", () => {
-          socket.emit("consumer-closed", {
-            consumerId: consumer.id,
-            producerId: targetProducer?.id,
-          });
-          consumingPeerState.webRtcConsumers.delete(consumer.id);
-          if (!consumer.closed) consumer.close();
-        });
-        consumer.observer.on("close", () =>
-          consumingPeerState.webRtcConsumers.delete(consumer.id),
-        );
-
-        callback({
-          params: {
-            id: consumer.id,
-            producerId,
-            kind: consumer.kind,
-            rtpParameters: consumer.rtpParameters,
-          },
-        });
-      } catch (error) {
-        console.error(
-          `${logPrefix} WebRTC consume error for ${socket.id}:`,
-          error,
-        );
-        callback({ error: (error as Error).message });
-      }
-    },
-  );
-
-  socket.on(
-    "consumer-resume",
-    async ({ consumerId }: { consumerId: string }) => {
-      const peerState = peerStates.get(socket.id);
-      const consumer = peerState?.webRtcConsumers.get(consumerId);
-      if (consumer && !consumer.closed) {
-        if (consumer.appData.hlsPipe) return;
-        try {
-          await consumer.resume();
-        } catch (error) {
-          console.error(
-            `${logPrefix} Error resuming WebRTC consumer ${consumerId}:`,
-            error,
-          );
-        }
-      }
-    },
-  );
 });
 
 function getNextRtpPorts(): {
