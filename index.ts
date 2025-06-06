@@ -9,9 +9,22 @@ import {
   writeFileSync,
 } from "node:fs";
 import { Server as SocketIOServer, type Socket } from "socket.io";
-import { createWorker, types as mediasoupTypes } from "mediasoup";
+import { createWorker } from "mediasoup";
 import { spawn, type ChildProcess } from "node:child_process";
 import path from "node:path";
+import type {
+  Consumer,
+  DtlsParameters,
+  PlainTransport,
+  Producer,
+  Router,
+  RtpCapabilities,
+  RtpCodecCapability,
+  RtpParameters,
+  Transport,
+  WebRtcTransport,
+  Worker,
+} from "mediasoup/node/lib/types";
 
 const options = {
   key: readFileSync("./server/ssl/key.pem", "utf-8"),
@@ -92,16 +105,16 @@ hlsHttpServer.listen(HLS_PORT, () => {
   );
 });
 
-let worker: mediasoupTypes.Worker;
-let router: mediasoupTypes.Router;
+let worker: Worker;
+let router: Router;
 
 interface RtpConsumerInfo {
-  consumer: mediasoupTypes.Consumer;
-  plainTransport: mediasoupTypes.PlainTransport;
+  consumer: Consumer;
+  plainTransport: PlainTransport;
   remoteRtpPort: number;
   remoteRtcpPort?: number;
   localRtcpPort?: number;
-  rtpParameters: mediasoupTypes.RtpParameters;
+  rtpParameters: RtpParameters;
   producerId: string;
   kind: "audio" | "video";
   socketId: string;
@@ -110,14 +123,14 @@ const hlsRtpConsumers = new Map<string, RtpConsumerInfo>();
 
 interface PeerState {
   socketId: string;
-  producerTransport?: mediasoupTypes.WebRtcTransport;
-  webRtcConsumerTransports: Map<string, mediasoupTypes.WebRtcTransport>;
-  webRtcConsumers: Map<string, mediasoupTypes.Consumer>;
-  producers: Map<string, mediasoupTypes.Producer>;
+  producerTransport?: WebRtcTransport;
+  webRtcConsumerTransports: Map<string, WebRtcTransport>;
+  webRtcConsumers: Map<string, Consumer>;
+  producers: Map<string, Producer>;
 }
 const peerStates = new Map<string, PeerState>();
 
-const mediaCodecs: mediasoupTypes.RtpCodecCapability[] = [
+const mediaCodecs: RtpCodecCapability[] = [
   {
     kind: "audio",
     mimeType: "audio/opus",
@@ -215,7 +228,7 @@ peersSocketIO.on("connection", async (socket: Socket) => {
     console.log(`${logPrefix} Client disconnected: ${socket.id}`);
     const state = peerStates.get(socket.id);
     if (state) {
-      for (const [kind, producer] of state.producers) {
+      for (const [_, producer] of state.producers) {
         if (!producer.closed) producer.close();
       }
       const hlsConsumersToClose = Array.from(hlsRtpConsumers.values()).filter(
@@ -286,12 +299,11 @@ peersSocketIO.on("connection", async (socket: Socket) => {
       dtlsParameters,
     }: {
       transportId: string;
-      dtlsParameters: mediasoupTypes.DtlsParameters;
+      dtlsParameters: DtlsParameters;
     }) => {
       const state = peerStates.get(socket.id);
       if (!state) return;
-      let transport: mediasoupTypes.Transport | undefined =
-        state.producerTransport;
+      let transport: Transport | undefined = state.producerTransport;
       if (state.producerTransport?.id !== transportId) {
         transport = state.webRtcConsumerTransports.get(transportId);
       }
@@ -323,7 +335,7 @@ peersSocketIO.on("connection", async (socket: Socket) => {
       }: {
         transportId: string;
         kind: "audio" | "video";
-        rtpParameters: mediasoupTypes.RtpParameters;
+        rtpParameters: RtpParameters;
         appData?: any;
       },
       callback,
@@ -403,7 +415,7 @@ peersSocketIO.on("connection", async (socket: Socket) => {
       }: {
         consumerTransportId: string;
         producerId: string;
-        rtpCapabilities: mediasoupTypes.RtpCapabilities;
+        rtpCapabilities: RtpCapabilities;
       },
       callback,
     ) => {
@@ -438,7 +450,7 @@ peersSocketIO.on("connection", async (socket: Socket) => {
         });
       }
 
-      let targetProducer: mediasoupTypes.Producer | undefined;
+      let targetProducer: Producer | undefined;
       let producerPeerId: string | undefined;
       for (const [peerId, otherPeerState] of peerStates) {
         if (otherPeerState.socketId === socket.id) continue;
@@ -580,10 +592,7 @@ function getNextRtpPorts(): {
   return { rtpPort, rtcpPort: rtcpMux ? undefined : rtpPort + 1, rtcpMux };
 }
 
-async function setupProducerForHls(
-  socketId: string,
-  producer: mediasoupTypes.Producer,
-) {
+async function setupProducerForHls(socketId: string, producer: Producer) {
   console.log(
     `${logPrefix} [HLS Pipe Setup] Producer ${producer.id} (${producer.kind}) from ${socketId}`,
   );
@@ -637,7 +646,7 @@ async function setupProducerForHls(
     return;
   }
 
-  let consumer: mediasoupTypes.Consumer;
+  let consumer: Consumer;
   try {
     consumer = await plainTransport.consume({
       producerId: producer.id,
