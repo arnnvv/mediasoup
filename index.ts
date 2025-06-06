@@ -72,8 +72,11 @@ const hlsHttpServer = createHttpServer(async (req, res) => {
     const fileContent = await readFile(filePath);
     res.writeHead(200);
     res.end(fileContent);
-  } catch (err: any) {
-    if (err.code === "ENOENT") {
+  } catch (err) {
+    if (
+      err instanceof Error &&
+      (err as NodeJS.ErrnoException).code === "ENOENT"
+    ) {
       if (reqUrl === "/playlist.m3u8") {
         res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
         res.writeHead(200);
@@ -172,7 +175,7 @@ const logPrefix = "[MediasoupServer]";
 
 (async () => {
   worker = await createWorker({
-    logLevel: "warn",
+    logLevel: "debug",
     logTags: ["rtp", "rtcp", "dtls", "ice", "score"],
     rtcMinPort: 10000,
     rtcMaxPort: 10100,
@@ -664,7 +667,7 @@ async function checkAndManageHlsFFmpeg() {
     completeParticipants.length < MAX_HLS_PARTICIPANTS &&
     isHlsStreamingActive
   ) {
-    await stopHlsFFmpeg();
+    stopHlsFFmpeg();
   }
 }
 
@@ -698,7 +701,8 @@ async function startHlsFFmpeg(ffmpegConsumers: RtpConsumerInfo[]) {
   const p1a = ffmpegConsumers.find(
     (c) => c.kind === "audio" && c.socketId === uniqueSocketIds[0],
   );
-  let p2v: RtpConsumerInfo | undefined, p2a: RtpConsumerInfo | undefined;
+  let p2v: RtpConsumerInfo | undefined;
+  let p2a: RtpConsumerInfo | undefined;
   if (uniqueSocketIds.length > 1) {
     p2v = ffmpegConsumers.find(
       (c) => c.kind === "video" && c.socketId === uniqueSocketIds[1],
@@ -846,26 +850,26 @@ async function startHlsFFmpeg(ffmpegConsumers: RtpConsumerInfo[]) {
   }, 3000);
 }
 
-async function stopHlsFFmpeg() {
+function stopHlsFFmpeg() {
   if (ffmpegProcess) {
     ffmpegProcess.kill("SIGINT");
   }
 }
 
 process.on("SIGINT", async () => {
-  await stopHlsFFmpeg();
+  stopHlsFFmpeg();
   const cleanupPromises = Array.from(hlsRtpConsumers.keys()).map(
     removeRtpConsumerForHls,
   );
   await Promise.all(cleanupPromises);
   for (const s of peerStates.values()) {
-    s.producers.forEach((p) => {
+    for (const [_, p] of s.producers) {
       if (!p.closed) p.close();
-    });
+    }
     s.producerTransport?.close();
-    s.webRtcConsumerTransports.forEach((t) => {
+    for (const [_, t] of s.webRtcConsumerTransports) {
       if (!t.closed) t.close();
-    });
+    }
   }
   peerStates.clear();
   if (router && !router.closed) router.close();
