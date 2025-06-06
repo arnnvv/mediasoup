@@ -13,6 +13,7 @@ import { createWorker } from "mediasoup";
 import { spawn, type ChildProcess } from "node:child_process";
 import path from "node:path";
 import type {
+  AppData,
   Consumer,
   DtlsParameters,
   PlainTransport,
@@ -336,7 +337,7 @@ peersSocketIO.on("connection", async (socket: Socket) => {
         transportId: string;
         kind: "audio" | "video";
         rtpParameters: RtpParameters;
-        appData?: any;
+        appData?: AppData;
       },
       callback,
     ) => {
