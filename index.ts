@@ -237,12 +237,12 @@ peersSocketIO.on("connection", async (socket: Socket) => {
       for (const rtpInfo of hlsConsumersToClose) {
         await removeRtpConsumerForHls(rtpInfo.consumer.id);
       }
-      state.webRtcConsumers.forEach((c) => {
+      for (const [_, c] of state.webRtcConsumers) {
         if (!c.closed) c.close();
-      });
-      state.webRtcConsumerTransports.forEach((t) => {
+      }
+      for (const [_, t] of state.webRtcConsumerTransports) {
         if (!t.closed) t.close();
-      });
+      }
       state.producerTransport?.close();
     }
     peerStates.delete(socket.id);
@@ -734,7 +734,8 @@ async function removeRtpConsumersByProducerId(producerId: string) {
 }
 
 function generateSdpForFFmpeg(ffmpegConsumers: RtpConsumerInfo[]): string {
-  let sdp = `v=0\no=- 0 0 IN IP4 127.0.0.1\ns=MediasoupCompositeHLS\nc=IN IP4 127.0.0.1\nt=0 0\n`;
+  let sdp =
+    "v=0\no=- 0 0 IN IP4 127.0.0.1\ns=MediasoupCompositeHLS\nc=IN IP4 127.0.0.1\nt=0 0\n";
   const sortedConsumers = [...ffmpegConsumers].sort((a, b) => {
     const socketIdCompare = a.socketId.localeCompare(b.socketId);
     if (socketIdCompare !== 0) return socketIdCompare;
@@ -743,7 +744,7 @@ function generateSdpForFFmpeg(ffmpegConsumers: RtpConsumerInfo[]): string {
     return 0;
   });
 
-  sortedConsumers.forEach((info) => {
+  for (const info of sortedConsumers) {
     const codec = info.rtpParameters.codecs[0];
     sdp += `m=${info.kind} ${info.remoteRtpPort} RTP/AVP ${codec.payloadType}\n`;
     sdp += `a=rtpmap:${codec.payloadType} ${codec.mimeType.split("/")[1]}/${codec.clockRate}${info.kind === "audio" && codec.channels ? `/${codec.channels}` : ""}\n`;
@@ -753,13 +754,13 @@ function generateSdpForFFmpeg(ffmpegConsumers: RtpConsumerInfo[]): string {
         .join(";");
       if (fmtp) sdp += `a=fmtp:${codec.payloadType} ${fmtp}\n`;
     }
-    if (info.rtpParameters.encodings && info.rtpParameters.encodings[0]?.ssrc) {
+    if (info.rtpParameters.encodings?.[0]?.ssrc) {
       sdp += `a=ssrc:${info.rtpParameters.encodings[0].ssrc}\n`;
     }
     if (info.remoteRtcpPort) sdp += `a=rtcp:${info.remoteRtcpPort}\n`;
-    else sdp += `a=rtcp-mux\n`;
-    sdp += `a=sendonly\n`;
-  });
+    else sdp += "a=rtcp-mux\n";
+    sdp += "a=sendonly\n";
+  }
   return sdp;
 }
 
@@ -769,12 +770,12 @@ async function checkAndManageHlsFFmpeg() {
     string,
     { video?: RtpConsumerInfo; audio?: RtpConsumerInfo }
   >();
-  activeHlsPipes.forEach((pipe) => {
+  for (const pipe of activeHlsPipes) {
     const pData = participantsData.get(pipe.socketId) || {};
     if (pipe.kind === "video") pData.video = pipe;
     if (pipe.kind === "audio") pData.audio = pipe;
     participantsData.set(pipe.socketId, pData);
-  });
+  }
 
   const completeParticipants = Array.from(participantsData.values())
     .filter((p) => p.video && p.audio)
@@ -795,10 +796,10 @@ async function checkAndManageHlsFFmpeg() {
         return aId.localeCompare(bId);
       },
     );
-    sortedCompleteParticipants.forEach((p) => {
+    for (const p of sortedCompleteParticipants) {
       if (p.video) consumersForSdp.push(p.video);
       if (p.audio) consumersForSdp.push(p.audio);
-    });
+    }
     await startHlsFFmpeg(consumersForSdp);
   } else if (
     completeParticipants.length < MAX_HLS_PARTICIPANTS &&
@@ -850,7 +851,7 @@ async function startHlsFFmpeg(ffmpegConsumers: RtpConsumerInfo[]) {
         rmSync(path.join(HLS_OUTPUT_DIR, f), { force: true, recursive: true });
     });
   } catch (err) {
-    /* ignore */
+    console.error(err);
   }
 
   const findSdpIndex = (c?: RtpConsumerInfo) =>
@@ -864,7 +865,8 @@ async function startHlsFFmpeg(ffmpegConsumers: RtpConsumerInfo[]) {
   const p1a = ffmpegConsumers.find(
     (c) => c.kind === "audio" && c.socketId === uniqueSocketIds[0],
   );
-  let p2v: RtpConsumerInfo | undefined, p2a: RtpConsumerInfo | undefined;
+  let p2v: RtpConsumerInfo | undefined;
+  let p2a: RtpConsumerInfo | undefined;
   if (uniqueSocketIds.length > 1) {
     p2v = ffmpegConsumers.find(
       (c) => c.kind === "video" && c.socketId === uniqueSocketIds[1],
@@ -885,19 +887,20 @@ async function startHlsFFmpeg(ffmpegConsumers: RtpConsumerInfo[]) {
   const outputMaps: string[] = [];
   if (p1vSdpIdx !== -1)
     filterComplex += `[0:${p1vSdpIdx}]setpts=PTS-STARTPTS,scale=640:360,fps=25[left];`;
-  else filterComplex += `nullsrc=size=640:360:rate=25[left];`;
+  else filterComplex += "nullsrc=size=640:360:rate=25[left];";
   if (p2vSdpIdx !== -1)
     filterComplex += `[0:${p2vSdpIdx}]setpts=PTS-STARTPTS,scale=640:360,fps=25[right];`;
-  else filterComplex += `nullsrc=size=640:360:rate=25[right];`;
-  filterComplex += `[left][right]hstack=inputs=2[v];`;
+  else filterComplex += "nullsrc=size=640:360:rate=25[right];";
+  filterComplex += "[left][right]hstack=inputs=2[v];";
   outputMaps.push("-map", "[v]");
   if (p1aSdpIdx !== -1)
     filterComplex += `[0:${p1aSdpIdx}]asetpts=PTS-STARTPTS,volume=0.8[a1];`;
-  else filterComplex += `anullsrc=channel_layout=stereo:sample_rate=48000[a1];`;
+  else filterComplex += "anullsrc=channel_layout=stereo:sample_rate=48000[a1];";
   if (p2aSdpIdx !== -1)
     filterComplex += `[0:${p2aSdpIdx}]asetpts=PTS-STARTPTS,volume=0.8[a2];`;
-  else filterComplex += `anullsrc=channel_layout=stereo:sample_rate=48000[a2];`;
-  filterComplex += `[a1][a2]amix=inputs=2:duration=longest:dropout_transition=2:normalize=0[a];`;
+  else filterComplex += "anullsrc=channel_layout=stereo:sample_rate=48000[a2];";
+  filterComplex +=
+    "[a1][a2]amix=inputs=2:duration=longest:dropout_transition=2:normalize=0[a];";
   outputMaps.push("-map", "[a]");
 
   const ffmpegArgs = [
@@ -1037,19 +1040,19 @@ process.on("SIGINT", async () => {
   console.log(`\n${logPrefix} SIGINT. Shutting down...`);
   await stopHlsFFmpeg();
   const cleanupPromises: Promise<any>[] = [];
-  hlsRtpConsumers.forEach((info) => {
+  for (const [_, info] of hlsRtpConsumers) {
     cleanupPromises.push(removeRtpConsumerForHls(info.consumer.id));
-  });
+  }
   await Promise.all(cleanupPromises);
-  peerStates.forEach((s) => {
-    s.producers.forEach((p) => {
+  for (const [_, s] of peerStates) {
+    for (const [_, p] of s.producers) {
       if (!p.closed) p.close();
-    });
+    }
     s.producerTransport?.close();
-    s.webRtcConsumerTransports.forEach((t) => {
+    for (const [_, t] of s.webRtcConsumerTransports) {
       if (!t.closed) t.close();
-    });
-  });
+    }
+  }
   peerStates.clear();
   if (router && !router.closed) router.close();
   hlsHttpServer.close(() =>
