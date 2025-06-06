@@ -843,13 +843,14 @@ async function startHlsFFmpeg(ffmpegConsumers: RtpConsumerInfo[]) {
   }
 
   try {
-    readdirSync(HLS_OUTPUT_DIR).forEach((f) => {
+    for (const f of readdirSync(HLS_OUTPUT_DIR)) {
       if (
         f.endsWith(".ts") ||
         (f.endsWith(".m3u8") && f !== path.basename(SDP_FILE_PATH))
-      )
+      ) {
         rmSync(path.join(HLS_OUTPUT_DIR, f), { force: true, recursive: true });
-    });
+      }
+    }
   } catch (err) {
     console.error(err);
   }
