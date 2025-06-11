@@ -39,8 +39,9 @@ if (!fsExistsSync(HLS_OUTPUT_DIR)) {
 }
 
 const hlsHttpServer = createHttpServer(async (req, res) => {
-  const reqUrl = req.url === "/" ? "/playlist.m3u8" : req.url;
-  const filePath = path.join(HLS_OUTPUT_DIR, reqUrl!);
+  const url = req.url ?? "/";
+  const reqUrl = url === "/" ? "/playlist.m3u8" : url;
+  const filePath = path.join(HLS_OUTPUT_DIR, reqUrl);
   if (filePath.indexOf(HLS_OUTPUT_DIR) !== 0) {
     res.writeHead(403);
     res.end("Forbidden");
