@@ -131,17 +131,35 @@ const mediaCodecs: RtpCodecCapability[] = [
     mimeType: "audio/opus",
     clockRate: 48000,
     channels: 2,
-    rtcpFeedback: [{ type: "nack" }, { type: "nack", parameter: "pli" }],
+    rtcpFeedback: [
+      {
+        type: "nack",
+      },
+      {
+        type: "nack",
+        parameter: "pli",
+      },
+    ],
   },
   {
     kind: "video",
     mimeType: "video/VP8",
     clockRate: 90000,
-    parameters: { "x-google-start-bitrate": 1000 },
+    parameters: {
+      "x-google-start-bitrate": 1000,
+    },
     rtcpFeedback: [
-      { type: "nack" },
-      { type: "nack", parameter: "pli" },
-      { type: "ccm", parameter: "fir" },
+      {
+        type: "nack",
+      },
+      {
+        type: "nack",
+        parameter: "pli",
+      },
+      {
+        type: "ccm",
+        parameter: "fir",
+      },
     ],
   },
   {
@@ -155,9 +173,17 @@ const mediaCodecs: RtpCodecCapability[] = [
       "x-google-start-bitrate": 1000,
     },
     rtcpFeedback: [
-      { type: "nack" },
-      { type: "nack", parameter: "pli" },
-      { type: "ccm", parameter: "fir" },
+      {
+        type: "nack",
+      },
+      {
+        type: "nack",
+        parameter: "pli",
+      },
+      {
+        type: "ccm",
+        parameter: "fir",
+      },
     ],
   },
 ];
@@ -177,7 +203,7 @@ const logPrefix = "[MediasoupServer]";
     rtcMaxPort: 10100,
   });
   worker.on("died", (err) => {
-    console.error(`${logPrefix} worker died:`, err);
+    console.error(`${logPrefix} worker died: ${err}`);
     process.exit(1);
   });
   router = await worker.createRouter({ mediaCodecs });
@@ -287,7 +313,12 @@ wss.on("connection", async (ws: CustomWebSocket) => {
             });
           try {
             const transport = await router.createWebRtcTransport({
-              listenIps: [{ ip: "0.0.0.0", announcedIp: "127.0.0.1" }],
+              listenIps: [
+                {
+                  ip: "0.0.0.0",
+                  announcedIp: "127.0.0.1",
+                },
+              ],
               enableUdp: true,
               enableTcp: true,
               preferUdp: true,
@@ -529,7 +560,10 @@ function getNextRtpPorts(): {
 async function setupProducerForHls(socketId: string, producer: Producer) {
   const { rtpPort, rtcpPort, rtcpMux } = getNextRtpPorts();
   const plainTransport = await router.createPlainTransport({
-    listenIp: { ip: "0.0.0.0", announcedIp: "127.0.0.1" },
+    listenIp: {
+      ip: "0.0.0.0",
+      announcedIp: "127.0.0.1",
+    },
     rtcpMux,
     comedia: false,
     enableSctp: false,
@@ -542,7 +576,11 @@ async function setupProducerForHls(socketId: string, producer: Producer) {
   });
 
   try {
-    await plainTransport.connect({ ip: "127.0.0.1", port: rtpPort, rtcpPort });
+    await plainTransport.connect({
+      ip: "127.0.0.1",
+      port: rtpPort,
+      rtcpPort,
+    });
   } catch (error) {
     plainTransport.close();
     return;
@@ -658,7 +696,10 @@ function generateSdpForFFmpeg(ffmpegConsumers: RtpConsumerInfo[]): string {
 async function checkAndManageHlsFFmpeg() {
   const participantsData = new Map<
     string,
-    { video?: RtpConsumerInfo; audio?: RtpConsumerInfo }
+    {
+      video?: RtpConsumerInfo;
+      audio?: RtpConsumerInfo;
+    }
   >();
   for (const pipe of hlsRtpConsumers.values()) {
     const pData = participantsData.get(pipe.socketId) || {};
