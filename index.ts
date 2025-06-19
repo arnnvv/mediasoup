@@ -13,7 +13,7 @@ import type {
   Transport,
   WebRtcTransport,
   Worker,
-} from "mediasoup/node/lib/types";
+} from "mediasoup/types";
 import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { WebSocketServer, WebSocket } from "ws";
 import { randomUUID } from "node:crypto";
