@@ -3,10 +3,6 @@ WORKDIR /app
 RUN corepack enable
 RUN apk add --no-cache python3 make g++ bash
 COPY package.json pnpm-lock.yaml ./
-RUN pnpm install --frozen-lockfile
-RUN cd node_modules/mediasoup && pnpm run worker:build
-RUN cd node_modules/mediasoup && pnpm pack && mv mediasoup-*.tgz /app/mediasoup.tgz
-RUN pnpm add ./mediasoup.tgz
 COPY . .
 RUN pnpm run b
 RUN pnpm prune --prod

@@ -1,9 +1,8 @@
 import { createServer as createHttpsServer } from "node:https";
 import { createServer as createHttpServer } from "node:http";
-import { readFileSync, existsSync as fsExistsSync, mkdirSync } from "node:fs";
+import { existsSync as fsExistsSync, mkdirSync } from "node:fs";
 import { createWorker } from "mediasoup";
 import { spawn, type ChildProcess } from "node:child_process";
-import path from "node:path";
 import type {
   Consumer,
   PlainTransport,
@@ -18,21 +17,31 @@ import type {
 import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { WebSocketServer, WebSocket } from "ws";
 import { randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 
-const options = {
-  key: readFileSync("./server/ssl/key.pem", "utf-8"),
-  cert: readFileSync("./server/ssl/cert.pem", "utf-8"),
-};
-const httpsServer = createHttpsServer(options);
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+const [key, cert] = await Promise.all([
+  readFile("./server/ssl/key.pem", "utf-8"),
+  readFile("./server/ssl/cert.pem", "utf-8"),
+]);
+
+const httpsServer = createHttpsServer({
+  key,
+  cert,
+});
+
 httpsServer.listen(3000, () => {
   console.log("HTTPS signaling server listening on port: 3000");
 });
 
 const wss = new WebSocketServer({ server: httpsServer, path: "/mediasoup" });
 
-const HLS_OUTPUT_DIR = path.join(__dirname, "hls_output_composite_rtp");
+const HLS_OUTPUT_DIR = join(__dirname, "hls_output_composite_rtp");
 const HLS_PORT = 8080;
-const SDP_FILE_PATH = path.join(HLS_OUTPUT_DIR, "composite_stream.sdp");
+const SDP_FILE_PATH = join(HLS_OUTPUT_DIR, "composite_stream.sdp");
 
 if (!fsExistsSync(HLS_OUTPUT_DIR)) {
   mkdirSync(HLS_OUTPUT_DIR, { recursive: true });
@@ -41,7 +50,7 @@ if (!fsExistsSync(HLS_OUTPUT_DIR)) {
 const hlsHttpServer = createHttpServer(async (req, res) => {
   const url = req.url ?? "/";
   const reqUrl = url === "/" ? "/playlist.m3u8" : url;
-  const filePath = path.join(HLS_OUTPUT_DIR, reqUrl);
+  const filePath = join(HLS_OUTPUT_DIR, reqUrl);
   if (filePath.indexOf(HLS_OUTPUT_DIR) !== 0) {
     res.writeHead(403);
     res.end("Forbidden");
@@ -581,7 +590,7 @@ async function setupProducerForHls(socketId: string, producer: Producer) {
       port: rtpPort,
       rtcpPort,
     });
-  } catch (error) {
+  } catch (_e) {
     plainTransport.close();
     return;
   }
@@ -616,7 +625,7 @@ async function setupProducerForHls(socketId: string, producer: Producer) {
         socketId,
       },
     });
-  } catch (error) {
+  } catch (_e) {
     plainTransport.close();
     return;
   }
@@ -871,8 +880,8 @@ async function startHlsFFmpeg(ffmpegConsumers: RtpConsumerInfo[]) {
     "-start_number",
     "0",
     "-hls_segment_filename",
-    path.join(HLS_OUTPUT_DIR, "segment_%05d.ts"),
-    path.join(HLS_OUTPUT_DIR, "playlist.m3u8"),
+    join(HLS_OUTPUT_DIR, "segment_%05d.ts"),
+    join(HLS_OUTPUT_DIR, "playlist.m3u8"),
   ];
 
   ffmpegProcess = spawn("ffmpeg", ffmpegArgs, { detached: false });

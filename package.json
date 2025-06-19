@@ -1,18 +1,19 @@
 {
+  "type": "module",
   "scripts": {
     "b": "tsc -b",
     "f": "biome format --write .",
     "l": "biome lint --write .",
     "d": "DETAILED_LOGGING=true node dist/index.js"
   },
-  "dependencies": {
-    "mediasoup": "^3.8.3",
-    "ws": "8.18.2"
-  },
   "devDependencies": {
-    "@biomejs/biome": "1.9.4",
-    "@types/node": "22.15.30",
+    "@biomejs/biome": "2.0.0",
+    "@types/node": "24.0.3",
     "@types/ws": "8.18.1",
     "typescript": "5.8.3"
+  },
+  "dependencies": {
+    "mediasoup": "3.16.0",
+    "ws": "8.18.2"
   }
 }
