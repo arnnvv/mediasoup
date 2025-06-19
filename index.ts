@@ -23,6 +23,8 @@ import { dirname, join } from "node:path";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
+const ANNOUNCED_IP = process.env.MEDIASOUP_ANNOUNCED_IP || "127.0.0.1";
+
 const [key, cert] = await Promise.all([
   readFile("./server/ssl/key.pem", "utf-8"),
   readFile("./server/ssl/cert.pem", "utf-8"),
@@ -325,7 +327,7 @@ wss.on("connection", async (ws: CustomWebSocket) => {
               listenIps: [
                 {
                   ip: "0.0.0.0",
-                  announcedIp: "127.0.0.1",
+                  announcedIp: ANNOUNCED_IP,
                 },
               ],
               enableUdp: true,
@@ -571,7 +573,7 @@ async function setupProducerForHls(socketId: string, producer: Producer) {
   const plainTransport = await router.createPlainTransport({
     listenIp: {
       ip: "0.0.0.0",
-      announcedIp: "127.0.0.1",
+      announcedIp: ANNOUNCED_IP,
     },
     rtcpMux,
     comedia: false,
