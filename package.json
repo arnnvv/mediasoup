@@ -7,14 +7,14 @@
     "d": "DETAILED_LOGGING=true node dist/index.js"
   },
   "devDependencies": {
-    "@biomejs/biome": "2.0.4",
-    "@types/node": "24.0.3",
+    "@biomejs/biome": "2.0.6",
+    "@types/node": "24.0.10",
     "@types/ws": "8.18.1",
     "esbuild": "0.25.5",
     "typescript": "5.8.3"
   },
   "dependencies": {
-    "mediasoup": "3.16.0",
-    "ws": "8.18.2"
+    "mediasoup": "3.16.4",
+    "ws": "8.18.3"
   }
 }
