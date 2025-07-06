@@ -1,4 +1,4 @@
-FROM node:24.2.0 AS builder
+FROM node:24.3.0-bookworm AS builder
 WORKDIR /app
 RUN apt-get update && apt-get install -y \
     python3 \
@@ -11,7 +11,7 @@ RUN pnpm install --frozen-lockfile
 COPY . .
 RUN pnpm run b
 RUN pnpm prune --prod
-FROM node:24.2.0-slim
+FROM node:24.3.0-slim
 WORKDIR /app
 COPY ffmpeg-wrapper.sh /usr/local/bin/ffmpeg
 RUN chmod +x /usr/local/bin/ffmpeg
