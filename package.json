@@ -1,7 +1,7 @@
 {
   "type": "module",
   "scripts": {
-    "b": "tsc --noEmit && esbuild index.ts --bundle --platform=node --format=esm --outfile=dist/index.js --packages=external --tsconfig=tsconfig.json",
+    "b": "tsc --noEmit && esbuild *.ts --bundle --platform=node --format=esm --outdir=dist --packages=external --tsconfig=tsconfig.json",
     "f": "biome format --write .",
     "l": "biome lint --write .",
     "d": "DETAILED_LOGGING=true node dist/index.js"

@@ -3,14 +3,18 @@
     "target": "es2022",
     "module": "esnext",
     "moduleResolution": "bundler",
-    "rootDir": "./",
     "esModuleInterop": true,
     "allowSyntheticDefaultImports": true,
     "forceConsistentCasingInFileNames": true,
     "strict": true,
+    "noUncheckedIndexedAccess": true,
     "skipLibCheck": true,
     "noEmit": true,
-    "types": ["node"]
+    "types": ["node"],
+    "lib": ["es2022"],
+    "moduleDetection": "force",
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true
   },
   "exclude": ["node_modules", "dist"]
 }

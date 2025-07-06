@@ -598,7 +598,7 @@ async function setupProducerForHls(socketId: string, producer: Producer) {
   }
 
   const producerCodecMimeType =
-    producer.rtpParameters.codecs[0].mimeType.toLowerCase();
+    producer.rtpParameters.codecs[0]?.mimeType.toLowerCase();
   const consumerCodecCap = router.rtpCapabilities.codecs?.find(
     (c) =>
       c.kind === producer.kind &&
@@ -687,9 +687,9 @@ function generateSdpForFFmpeg(ffmpegConsumers: RtpConsumerInfo[]): string {
 
   for (const info of sortedConsumers) {
     const codec = info.rtpParameters.codecs[0];
-    sdp += `m=${info.kind} ${info.remoteRtpPort} RTP/AVP ${codec.payloadType}\n`;
-    sdp += `a=rtpmap:${codec.payloadType} ${codec.mimeType.split("/")[1]}/${codec.clockRate}${info.kind === "audio" && codec.channels ? `/${codec.channels}` : ""}\n`;
-    if (codec.parameters && Object.keys(codec.parameters).length > 0) {
+    sdp += `m=${info.kind} ${info.remoteRtpPort} RTP/AVP ${codec?.payloadType}\n`;
+    sdp += `a=rtpmap:${codec?.payloadType} ${codec?.mimeType.split("/")[1]}/${codec?.clockRate}${info.kind === "audio" && codec?.channels ? `/${codec.channels}` : ""}\n`;
+    if (codec?.parameters && Object.keys(codec.parameters).length > 0) {
       const fmtp = Object.entries(codec.parameters)
         .map(([k, v]) => `${k}=${v}`)
         .join(";");
